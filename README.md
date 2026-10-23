@@ -1,0 +1,1 @@
+# EarthMC-Map-Addon-Chinese
