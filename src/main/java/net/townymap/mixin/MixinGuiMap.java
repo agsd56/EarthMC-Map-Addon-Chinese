@@ -1,0 +1,806 @@
+package net.townymap.mixin;
+
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gl.RenderPipelines;
+import net.minecraft.client.gui.Click;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.input.CharInput;
+import net.minecraft.client.input.KeyInput;
+import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.util.Identifier;
+import org.joml.Matrix3x2fStack;
+import net.townymap.TownyMapMod;
+import net.townymap.gui.TownInfoOverlay;
+import net.townymap.gui.TownSearchOverlay;
+import net.townymap.model.MapJumpTarget;
+import net.townymap.model.TownData;
+import org.objectweb.asm.Opcodes;
+import org.lwjgl.glfw.GLFW;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Constant;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.ModifyConstant;
+import org.spongepowered.asm.mixin.injection.Redirect;
+import org.spongepowered.asm.mixin.injection.Slice;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import java.lang.reflect.Method;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Injects into Xaero's GuiMap.
+ *
+ * Rendering order inside method_25394 (Screen.render):
+ *   1. renderPreDropdown — waypoints, labels, town overlays (HEAD/RETURN inject here)
+ *   2. Squaremap tile compositing (DrawContext flush in onBeforePlayerArrow)
+ *   3. Xaero's player arrow (drawArrowOnMap via vertex buffers)
+ *   4. method_25394 RETURN — our arrow re-draw fires here, guaranteed on top of tiles
+ *
+ * Town overlays and info UI render at renderPreDropdown HEAD (clean matrix state).
+ * The player arrow MUST render at method_25394 RETURN so it lands after the
+ * squaremap DrawContext flush, not before it.
+ *
+ * method_25402 = mouseClicked(Click, boolean) in MC 1.21.11.
+ */
+@Mixin(targets = "xaero.map.gui.GuiMap", remap = false)
+public abstract class MixinGuiMap {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("TownyMapAddon");
+    private static final AtomicBoolean MAP_SURFACE_ERROR_LOGGED = new AtomicBoolean(false);
+    private static final AtomicBoolean RENDER_ERROR_LOGGED = new AtomicBoolean(false);
+    private static final AtomicBoolean CLICK_ERROR_LOGGED = new AtomicBoolean(false);
+    @org.spongepowered.asm.mixin.Unique
+    private boolean townymap$widgetsHidden = false;
+    /** Widgets wider or taller than this share of the screen are never hidden — that's map surface, not UI. */
+    @org.spongepowered.asm.mixin.Unique
+    private static final double TOWNYMAP_MAX_HIDEABLE_FRACTION = 0.4;
+    // TEST: how much further "World Map Overview" lets you zoom out (Xaero's min destScale / this).
+    private static final double WORLD_MAP_OVERVIEW_FACTOR = 8.0;
+
+    /**
+     * Xaero's "camera follows player" lock. extractRenderState re-snaps cameraX/cameraZ to the player at
+     * the TOP of every frame while this is set, so any camera we write later in the same method was
+     * overwritten before it could be drawn -- which is why recentring appeared to do nothing. Xaero
+     * clears it itself the moment the user drags the map; moving the camera means detaching it.
+     */
+    @Shadow(remap = false) private static boolean attachedCamera;
+
+    /**
+     * Xaero's one-shot "put the camera back on the player" flag, set when the map opens. Cleared every
+     * frame while the map shows a world the player is not in -- otherwise reopening the map planted the
+     * view at their Earth coordinates on the Moon, further off the lunar map the further out they stood.
+     */
+    @Shadow(remap = false) private boolean shouldResetCameraPos;
+
+    @Shadow(remap = false) private double cameraX;
+    @Shadow(remap = false) private double cameraZ;
+    @Shadow(remap = false) private double scale;
+    @Shadow(remap = false) private double screenScale;
+
+    // Extend Xaero's zoom-out floor when "World Map Overview" is on: Xaero clamps the world-map zoom
+    // at 0.0625; we lower that floor so the user can zoom out far enough to see the whole EarthMC map.
+    // Because we only change Xaero's own zoom, the tiles, player arrow and our overlay all share one
+    // scale and stay aligned. Xaero <=1.41.x clamps inline in changeZoom; 1.42.0 moved the clamp into
+    // a new applyZoomLimits() (which silently broke the old single hook on 26.2). Patch the 0.0625
+    // floor in BOTH, each require = 0, so whichever method the installed Xaero has gets patched and
+    // the other no-ops instead of failing.
+    @ModifyConstant(method = "changeZoom", constant = @Constant(doubleValue = 0.0625), require = 0, remap = false)
+    private double townymap$extendWorldMapZoomOut(double original) {
+        return (TownyMapMod.getConfig() != null && TownyMapMod.getConfig().worldMapOverview)
+                ? original / WORLD_MAP_OVERVIEW_FACTOR
+                : original;
+    }
+
+    @ModifyConstant(method = "applyZoomLimits", constant = @Constant(doubleValue = 0.0625), require = 0, remap = false)
+    private double townymap$extendWorldMapZoomOutModern(double original) {
+        return (TownyMapMod.getConfig() != null && TownyMapMod.getConfig().worldMapOverview)
+                ? original / WORLD_MAP_OVERVIEW_FACTOR
+                : original;
+    }
+
+    // ── All overlay rendering at HEAD (clean GL/matrix state) ─────────────────
+
+    @Inject(require = 0, 
+            method = "method_25394",
+            at = @At(
+                    value = "FIELD",
+                    target = "Lxaero/map/common/config/option/WorldMapProfiledConfigOptions;ARROW:Lxaero/lib/common/config/option/BooleanConfigOption;",
+                    opcode = Opcodes.GETSTATIC,
+                    shift = At.Shift.BEFORE
+            ),
+            remap = false
+    )
+    private void onBeforePlayerArrow(DrawContext ctx, int mouseX, int mouseY,
+                                     float delta, CallbackInfo ci) {
+        // Clear the search bar when the map is reopened (new GuiMap instance) or panned. Tracked on the
+        // raw camera every frame, regardless of dimension. jumpTo() suppresses the next pan-clear so that
+        // centre-on-select doesn't wipe the bar.
+        TownyMapMod.noteWorldMapInjectAlive();
+        TownyMapMod.onWorldMapFrame(this, cameraX, cameraZ);
+        // A world switch leaves the camera at coordinates belonging to the world we left. Re-aim before
+        // anything is drawn, and suppress the pan-clear so it does not read as the user panning.
+        applyPendingRecentre();
+        if (TownyMapMod.isAccessBlocked()) return;
+        // The EarthMC map is overworld-only. Outside the overworld our overlay is hidden, except in
+        // "Overworld Coords" mode in the Nether, where we scale the overlay's camera x8 and its
+        // block-scale /8 so the overworld map/towns line up exactly over Xaero's real Nether tiles.
+        double dimMul = TownyMapMod.worldMapOverlayScale();
+        if (dimMul <= 0.0) return;
+        try {
+            MinecraftClient mc = MinecraftClient.getInstance();
+            int w = mc.getWindow().getScaledWidth();
+            int h = mc.getWindow().getScaledHeight();
+            double guiScale = (screenScale > 0) ? scale / screenScale : scale;
+            double camX = cameraX * dimMul;
+            double camZ = cameraZ * dimMul;
+            double mapScale = guiScale / dimMul;
+            TownyMapMod.renderSquaremapBackground(ctx, camX, camZ, mapScale, w, h);
+            TownyMapMod.renderOnWorldMap(ctx, camX, camZ, mapScale, w, h);
+            if (mapScale > 0) {
+                double worldX = (mouseX - w / 2.0) / mapScale + camX;
+                double worldZ = (mouseY - h / 2.0) / mapScale + camZ;
+                TownyMapMod.renderHoveredWorldMapChunk(ctx, camX, camZ, mapScale, w, h, worldX, worldZ);
+                TownyMapMod.renderChunkCounter(ctx, camX, camZ, mapScale, w, h, worldX, worldZ);
+            }
+            ctx.drawDeferredElements();
+            clearDepthForXaeroArrowIfAvailable();
+            disableDepthTestIfAvailable();
+        } catch (Exception e) {
+            logOnce(MAP_SURFACE_ERROR_LOGGED, "Failed to render world-map surface overlay", e);
+        }
+    }
+
+    @Inject(require = 0, method = "renderPreDropdown", at = @At("HEAD"), remap = false)
+    private void onRenderPreDropdown(DrawContext ctx, int mouseX, int mouseY,
+                                     float delta, CallbackInfo ci) {
+        TownyMapMod.noteWorldMapInjectAlive();
+        if (TownyMapMod.isAccessBlocked()) return;
+        applyPendingRecentre();
+        // Remember where the camera is left in this world so switching back returns to it rather than
+        // to the claim centre every time.
+        double camScale = TownyMapMod.worldMapCoordinateScale();
+        TownyMapMod.noteWorldMapCamera(cameraX * camScale, cameraZ * camScale);
+        // Freshness line goes HERE, not in the overlay inject: the squaremap tiles are drawn after that
+        // one and painted straight over it, so the line vanished whenever the layer was switched on.
+        // renderPreDropdown runs late enough to sit on top of everything. Screen-space at a fixed Y, so
+        // it lands under Xaero's coordinates from here too, and it still reports outside the overworld.
+        try {
+            TownyMapMod.renderMapDataStatus(ctx);
+        } catch (Throwable ignored) {
+            // A broken status line must never take the map down with it -- that has happened twice.
+        }
+        try {
+            // Hide Xaero's own buttons for the capture too. Only SMALL widgets are touched: hiding every
+            // widget last time took Xaero's map surface with it, so anything occupying a large share of the
+            // screen is left alone no matter what it is. Restored the frame after, and the armed state times
+            // out on its own, so this can't get stuck the way it did before.
+            boolean composing = TownyMapMod.hideChromeForScreenshot();
+            if (composing != townymap$widgetsHidden) {
+                townymap$setSmallWidgetsVisible(!composing);
+                townymap$widgetsHidden = composing;
+            }
+            // Arrow first, so the UI panels below queue on top of it in the batch.
+            // It's a "you are here" marker, so it has no place in a shared picture of the map.
+            if (!composing) renderPlayerArrow(ctx);
+
+            MinecraftClient mc = MinecraftClient.getInstance();
+            int w = mc.getWindow().getScaledWidth();
+            int h = mc.getWindow().getScaledHeight();
+            // Player dots here (not in the tile batch of onBeforePlayerArrow): the tiles are already flushed,
+            // so the dots render on top of them and stop "blinking" behind async tile rebuilds at zoom-out.
+            double dimMul = TownyMapMod.worldMapOverlayScale();
+            if (dimMul > 0.0) {
+                double guiScale = (screenScale > 0) ? scale / screenScale : scale;
+                double mapScale = guiScale / dimMul;
+                TownyMapMod.renderWorldMapLatePass(ctx, cameraX * dimMul, cameraZ * dimMul, mapScale, w, h);
+            }
+            // A clean map screenshot skips our own chrome for the frame, so the capture is just the map.
+            if (!TownyMapMod.hideChromeForScreenshot()) {
+                double[] world = overlayWorldFromScreen(mouseX, mouseY, w, h);
+                if (world != null) {
+                    TownyMapMod.renderTownHover(ctx, mouseX, mouseY, world[0], world[1], w, h);
+                }
+                TownyMapMod.renderTownInfo(ctx, w, h);
+                TownyMapMod.renderMapToggles(ctx, h);
+                TownyMapMod.renderPlanningCounter(ctx, w, h);
+                TownyMapMod.renderTownSearch(ctx, w, h);
+                TownyMapMod.renderArchiveBanner(ctx, w);
+            }
+            TownyMapMod.captureMapScreenshotIfArmed();
+        } catch (Exception e) {
+            logOnce(RENDER_ERROR_LOGGED, "Failed to render Xaero world-map overlay", e);
+        }
+    }
+
+    // Player arrow, drawn via DrawContext at the START of renderPreDropdown.
+    //
+    // Layering requirement: the arrow must sit ABOVE the squaremap tiles but BELOW
+    // our UI panels (search bar, town info, toggles).  The chronology in
+    // method_25394 is: onBeforePlayerArrow (tiles drawn + drawDeferredElements
+    // flush) → renderPreDropdown (our overlays) → RETURN.  Drawing the arrow here,
+    // before the UI panels, queues it into the deferred batch ahead of them, so the
+    // arrow renders under the UI; and since the tiles were already flushed in
+    // onBeforePlayerArrow, the arrow still renders on top of the tiles.
+    //
+    // (Previously this drew at method_25394 RETURN, which queued the arrow AFTER the
+    // UI panels — making the arrow draw over the search box.)
+    /**
+     * Applies a pending world-switch recentre.
+     *
+     * <p>Called from both injects on purpose. onBeforePlayerArrow anchors on a field access late in
+     * extractRenderState, and that anchor has silently stopped matching across Xaero updates before;
+     * renderPreDropdown is the anchor the whole overlay already depends on, so if the map is drawing at
+     * all this one runs. consumeWorldMapRecentre() clears itself, so whichever fires first wins.
+     */
+    private void applyPendingRecentre() {
+        // Both of Xaero's player-snap paths, every frame, for as long as the map is off-world: the
+        // attached-camera lock and the reset-on-open flag both assign the player's position at the top
+        // of extractRenderState, which is what kept dragging the Moon view back to Earth coordinates.
+        if (TownyMapMod.pinWorldMapCamera()) {
+            attachedCamera = false;
+            shouldResetCameraPos = false;
+        }
+        double[] recentre = TownyMapMod.consumeWorldMapRecentre();
+        if (recentre == null) return;
+        double dimScale = TownyMapMod.worldMapCoordinateScale();
+        TownyMapMod.suppressNextPanClear();
+        attachedCamera = false;   // a locked camera re-snaps to the player next frame
+        cameraX = recentre[0] / dimScale;
+        cameraZ = recentre[1] / dimScale;
+    }
+
+    private void renderPlayerArrow(DrawContext ctx) {
+        try {
+            // We redraw Xaero's arrow ourselves for layering, so suppressing Xaero's own copy was only
+            // half the job -- this one has to go too, or the player still appears standing on the Moon.
+            if (TownyMapMod.hideWorldMapPlayerArrow()) return;
+            if (!TownyMapMod.shouldRenderWorldMapIndicatorOverlay()) return;
+            MinecraftClient mc = MinecraftClient.getInstance();
+            ClientPlayerEntity player = mc.player;
+            if (player == null || mc.world == null) return;
+
+            int w = mc.getWindow().getScaledWidth();
+            int h = mc.getWindow().getScaledHeight();
+            double guiScale = (screenScale > 0) ? scale / screenScale : scale;
+            if (guiScale <= 0) return;
+
+            double dx = player.getX() - cameraX;
+            double dz = player.getZ() - cameraZ;
+            float sx = (float) (w / 2.0 + dx * guiScale);
+            float sy = (float) (h / 2.0 + dz * guiScale);
+            if (sx < -32 || sx > w + 32 || sy < -32 || sy > h + 32) return;
+
+            float yawRad = (float) Math.toRadians(player.getYaw());
+            Matrix3x2fStack m = ctx.getMatrices();
+
+            // Replicate Xaero's own arrow sizing.
+            // Xaero passes sc = scaleMultiplier / scale to drawObjectOnMap, which then
+            // calls matrixStack.scale(sc, sc, 1) in a coordinate space where 1 unit =
+            // 1 world block (their map matrix already encodes guiScale).  So the arrow
+            // appears 26 * sc * guiScale = 26 * smult / screenScale GUI pixels wide —
+            // constant regardless of zoom, only growing on HiDPI screens > 1080 px tall.
+            int fwMin = Math.min(mc.getWindow().getFramebufferWidth(),
+                                 mc.getWindow().getFramebufferHeight());
+            double scaleMultiplier = fwMin <= 1080 ? 1.0 : fwMin / 1080.0;
+            float arrowScale = (float) Math.max(0.2, Math.min(2.0,
+                    scaleMultiplier / Math.max(1, screenScale)));
+            float shadowOffset = 2f * arrowScale;
+
+            // Shadow — offset south in pre-rotation space, then scale
+            m.pushMatrix();
+            m.translate(sx, sy + shadowOffset);
+            m.rotate(yawRad);
+            m.scale(arrowScale, arrowScale);
+            drawXaeroArrowSprite(ctx, 0xE5000000);
+            m.popMatrix();
+
+            // Main arrow — Xaero colour: r=1, g=0.08, b=0.08, a=1
+            m.pushMatrix();
+            m.translate(sx, sy);
+            m.rotate(yawRad);
+            m.scale(arrowScale, arrowScale);
+            drawXaeroArrowSprite(ctx, 0xFFFF1414);
+            m.popMatrix();
+        } catch (Exception e) {
+            logOnce(RENDER_ERROR_LOGGED, "Failed to render world-map arrow overlay", e);
+        }
+    }
+
+    /**
+     * Draws Xaero's own arrow sprite (from assets/xaeroworldmap/gui/gui.png) via
+     * DrawContext so it composites on top of the squaremap deferred tile batch.
+     *
+     * UV in the 256×256 sheet: origin (13, 5), size 26×28.
+     * Xaero centers it by drawing at screen position (−13, −5) in local space.
+     * The caller must have already applied the player-yaw rotation to the matrix.
+     *
+     * @param color ARGB tint — 0xFFFF1414 for the red arrow, 0xE5000000 for shadow.
+     */
+    private static final Identifier XAERO_GUI = Identifier.of("xaeroworldmap", "gui/gui.png");
+
+    private static void drawXaeroArrowSprite(DrawContext ctx, int color) {
+        ctx.drawTexture(RenderPipelines.GUI_TEXTURED, XAERO_GUI,
+                -13, -5,   // screen position (centers the 26-wide sprite at x=0)
+                0f, 0f,    // UV start in the 256×256 sheet (sprite is at top-left)
+                26, 28,    // sprite size
+                256, 256,  // full texture size
+                color);
+    }
+
+    /** Converts a screen position to the EarthMC overlay's WORLD coords, applying the same dimension scale
+     *  (dimMul) the overlay renders with. In the Nether's "Overworld Coords" mode the overlay is drawn at
+     *  overworld scale (dimMul=8), so without this a hover/click would look up towns at raw Nether
+     *  coordinates and always land on wilderness. Returns null when the overlay isn't shown. */
+    private double[] overlayWorldFromScreen(double screenX, double screenY, int sw, int sh) {
+        double dimMul = TownyMapMod.worldMapOverlayScale();
+        if (dimMul <= 0.0) return null;
+        double guiScale = (screenScale > 0) ? scale / screenScale : scale;
+        if (guiScale <= 0) return null;
+        double mapScale = guiScale / dimMul;
+        return new double[] {
+                (screenX - sw / 2.0) / mapScale + cameraX * dimMul,
+                (screenY - sh / 2.0) / mapScale + cameraZ * dimMul
+        };
+    }
+
+    // ── Mouse click ───────────────────────────────────────────────────────────
+
+    @Inject(require = 0, method = "method_25402", at = @At("HEAD"), remap = false, cancellable = true)
+    private void onMouseClicked(Click click, boolean bl,
+                                CallbackInfoReturnable<Boolean> cir) {
+        if (TownyMapMod.isAccessBlocked()) return;   // let Xaero handle it as if we were not installed
+        try {
+            int button = click.buttonInfo().button();
+            MinecraftClient mc = MinecraftClient.getInstance();
+            int sw = mc.getWindow().getScaledWidth();
+            int sh = mc.getWindow().getScaledHeight();
+
+            if (button == 0 && net.townymap.gui.TownSearchOverlay.isExpandClick(click.x(), click.y())) {
+                TownyMapMod.openStatsPanel();
+                cir.setReturnValue(true);
+                return;
+            }
+            if (button == 0) {
+                // The freshness line's [R] button, checked before the search bar so it wins the click.
+                if (TownyMapMod.clickMapDataStatus(click.x(), click.y())) {
+                    cir.setReturnValue(true);
+                    return;
+                }
+                TownSearchOverlay.ClickResult result =
+                        TownyMapMod.onTownSearchClick(click.x(), click.y(), sw, sh);
+                if (result.consumed()) {
+                    handleJumpOrRoute(result.target());
+                    cir.setReturnValue(true);
+                    return;
+                }
+            }
+
+            if (button == 0) {
+                TownInfoOverlay.ActionResult action = TownyMapMod.onTownInfoClick(click.x(), click.y());
+                if (action.action() != TownInfoOverlay.Action.NONE) {
+                    cir.setReturnValue(true);
+                    return;
+                }
+            }
+
+            if (button == 0 && TownyMapMod.onSettingsButtonClick(click.x(), click.y(), sh)) {
+                TownyMapMod.openConfigScreen();
+                cir.setReturnValue(true);
+                return;
+            }
+
+            if (button == 0 && TownyMapMod.onMapToggleClick(click.x(), click.y(), sh)) {
+                cir.setReturnValue(true);
+                return;
+            }
+
+            // Planning counter chips ("+" arms placement, T# removes that planned town).
+            if (button == 0 && TownyMapMod.onPlanningCounterClick(click.x(), click.y())) {
+                cir.setReturnValue(true);
+                return;
+            }
+
+            // With "+" armed, the next map click drops a planned town instead of selecting anything.
+            if (button == 0) {
+                double dimMul = TownyMapMod.worldMapOverlayScale();
+                double guiScale = (screenScale > 0) ? scale / screenScale : scale;
+                if (dimMul > 0.0 && guiScale > 0.0
+                        && TownyMapMod.onPlanningMapClick(click.x(), click.y(),
+                                cameraX * dimMul, cameraZ * dimMul, guiScale / dimMul, sw, sh)) {
+                    cir.setReturnValue(true);
+                    return;
+                }
+            }
+
+            // Left-click a date-step arrow under the archive banner (±1 / ±10 days).
+            if (button == 0 && TownyMapMod.onArchiveNavClick(click.x(), click.y())) {
+                cir.setReturnValue(true);
+                return;
+            }
+
+            // Left-click the archive banner exits archive mode.
+            if (button == 0 && TownyMapMod.onArchiveBannerClick(click.x(), click.y())) {
+                cir.setReturnValue(true);
+                return;
+            }
+
+            // Left-click a player dot/head → open the small player info panel (which has Expand). Uses the
+            // overlay's own camera + scale so the hit-test matches exactly where the markers were drawn.
+            if (button == 0) {
+                double dimMul = TownyMapMod.worldMapOverlayScale();
+                double guiScale = (screenScale > 0) ? scale / screenScale : scale;
+                if (dimMul > 0.0 && guiScale > 0.0
+                        && TownyMapMod.onMapPlayerClick(click.x(), click.y(),
+                                cameraX * dimMul, cameraZ * dimMul, guiScale / dimMul, sw, sh)) {
+                    cir.setReturnValue(true);
+                    return;
+                }
+            }
+
+            // Left-click a nation capital star → open the small nation info panel (which has Expand). The
+            // star screen positions are recorded as drawn, so this is a direct screen-space hit-test.
+            if (button == 0 && TownyMapMod.onMapNationStarClick(click.x(), click.y())) {
+                cir.setReturnValue(true);
+                return;
+            }
+
+            // Right-click on our buttons: consume so it never falls through to the map (no
+            // town/wilderness selection behind the button), and cycle mode toggles backward.
+            if (button == 1 && TownyMapMod.onSettingsButtonClick(click.x(), click.y(), sh)) {
+                cir.setReturnValue(true);
+                return;
+            }
+            if (button == 1 && TownyMapMod.onMapToggleClick(click.x(), click.y(), sh, true)) {
+                cir.setReturnValue(true);
+                return;
+            }
+
+            if (button == 1 && TownyMapMod.isChunkCounterActive()) {
+                double[] world = overlayWorldFromScreen(click.x(), click.y(), sw, sh);
+                if (world != null) {
+                    TownyMapMod.onChunkCounterClick(world[0], world[1]);
+                }
+                cir.setReturnValue(true);
+                return;
+            }
+
+            if (button == 0) {
+                TownyMapMod.armMapClickDismiss(cameraX, cameraZ);   // dismiss the search/popup unless this
+                return;                                             // click turns into a pan-drag (keeps it)
+            }
+            if (button != 1) return;
+
+            double[] world = overlayWorldFromScreen(click.x(), click.y(), sw, sh);
+            if (world == null) return;
+
+            double dimMul = TownyMapMod.worldMapOverlayScale();
+            double guiScale = (screenScale > 0) ? scale / screenScale : scale;
+            if (guiScale > 0.0 && TownyMapMod.onPlanningRemoveAt(world[0], world[1], dimMul / guiScale)) {
+                cir.setReturnValue(true);
+                return;
+            }
+
+            TownyMapMod.onMapRightClick(world[0], world[1], (int) click.x(), (int) click.y());
+            cir.setReturnValue(true);
+        } catch (Exception e) {
+            logOnce(CLICK_ERROR_LOGGED, "Failed to handle Xaero world-map click", e);
+        }
+    }
+
+    @Inject(require = 0, method = "method_25404", at = @At("HEAD"), remap = false, cancellable = true)
+    private void onKeyPressed(KeyInput input,
+                              CallbackInfoReturnable<Boolean> cir) {
+        if (TownyMapMod.isAccessBlocked()) return;   // let Xaero handle it as if we were not installed
+        try {
+            // The clean-screenshot key is a normal rebindable keybind (Options -> Controls). Screens
+            // swallow key presses, so match it here too — but never while the search bar has focus.
+            if (!TownSearchOverlay.isFocused()
+                    && net.townymap.input.TownyMapKeybinds.isMapScreenshotKey(input)) {
+                TownyMapMod.armMapScreenshot();
+                cir.setReturnValue(true);
+                return;
+            }
+            // Same story for refresh and the info panel: the map screen eats key presses, so the binds
+            // have to be matched here as well to work with the map open. Never while the search bar has
+            // focus, or typing "r" into it would reload the claims.
+            if (!TownSearchOverlay.isFocused()) {
+                if (net.townymap.input.TownyMapKeybinds.isRefreshKey(input)) {
+                    TownyMapMod.refreshTownClaimsFromSettings();
+                    cir.setReturnValue(true);
+                    return;
+                }
+                if (net.townymap.input.TownyMapKeybinds.isOpenStatsKey(input)) {
+                    TownyMapMod.openStatsPanel();
+                    cir.setReturnValue(true);
+                    return;
+                }
+            }
+            if (input.key() == GLFW.GLFW_KEY_ESCAPE && TownyMapMod.onPlanningEscape()) {
+                cir.setReturnValue(true);
+                return;
+            }
+            TownSearchOverlay.ClickResult result = TownyMapMod.onTownSearchKeyPressed(input.key());
+            if (result.consumed()) {
+                jumpTo(result.target());
+                cir.setReturnValue(true);
+            }
+        } catch (Exception e) {
+            logOnce(CLICK_ERROR_LOGGED, "Failed to handle Xaero world-map key press", e);
+        }
+    }
+
+    @Inject(require = 0, method = "method_25400", at = @At("HEAD"), remap = false, cancellable = true)
+    private void onCharTyped(CharInput input, CallbackInfoReturnable<Boolean> cir) {
+        try {
+            if (!input.isValidChar()) return;
+            boolean consumed = false;
+            String text = input.asString();
+            for (int i = 0; i < text.length(); i++) {
+                consumed |= TownyMapMod.onTownSearchCharTyped(text.charAt(i));
+            }
+            if (consumed) {
+                cir.setReturnValue(true);
+            }
+        } catch (Exception e) {
+            logOnce(CLICK_ERROR_LOGGED, "Failed to handle Xaero world-map text input", e);
+        }
+    }
+
+    // Search results carry EarthMC (overworld) coordinates, but Xaero's camera is in the player's
+    // current dimension. Without the divide, jumping to a town from the Nether centred the map 8x
+    // too far out and the target wasn't on screen at all.
+    /**
+     * Suppresses Xaero's own player arrow while the map shows a world the player is not standing in.
+     *
+     * <p>Xaero gates the arrow on {@code getEffective(ARROW).booleanValue()} and skips the whole block
+     * when that reads false, so answering false is enough -- the drawing itself is untouched.
+     *
+     * <p>The slice bounds the redirect to the few instructions between the ARROW and ARROW_COLOR field
+     * reads, where exactly one booleanValue() call lives. Bounding it by ordinal instead would break
+     * whenever Xaero adds a setting, which has silently happened to this file before. The handler takes
+     * only JDK types on purpose: xaero.lib is not on our compile classpath, and the descriptors naming
+     * it here are plain strings.
+     */
+    @Redirect(require = 0, remap = false, method = "extractRenderState",
+            slice = @Slice(
+                    from = @At(value = "FIELD", opcode = Opcodes.GETSTATIC,
+                            target = "Lxaero/map/common/config/option/WorldMapProfiledConfigOptions;"
+                                   + "ARROW:Lxaero/lib/common/config/option/BooleanConfigOption;"),
+                    to = @At(value = "FIELD", opcode = Opcodes.GETSTATIC,
+                            target = "Lxaero/map/common/config/option/WorldMapProfiledConfigOptions;"
+                                   + "ARROW_COLOR:Lxaero/lib/common/config/option/RangeConfigOption;")),
+            at = @At(value = "INVOKE", target = "Ljava/lang/Boolean;booleanValue()Z"))
+    private boolean townymap$hidePlayerArrowOffWorld(Boolean value) {
+        return value.booleanValue() && !TownyMapMod.hideWorldMapPlayerArrow();
+    }
+
+    /**
+     * Keeps the player's own waypoints off a map showing a world they are not in.
+     *
+     * <p>Xaero hands waypoint work to SupportXaeroMinimap.checkWaypoints; skipping that call leaves the
+     * map without them. Their coordinates belong to the player's world, so on the Moon they would mark
+     * lunar ground the player has never stood on.
+     */
+    @Redirect(require = 0, remap = false, method = "extractRenderState",
+            at = @At(value = "INVOKE",
+                    // Name only, no descriptor: the full one names Minecraft types, which are
+                    // intermediary at runtime under Fabric's remapped mappings, so a literal
+                    // remap = false descriptor would silently never match there. checkWaypoints has a
+                    // single overload, so the name resolves it on every branch.
+                    target = "Lxaero/map/mods/SupportXaeroMinimap;checkWaypoints"))
+    private void townymap$skipWaypointsOffWorld(
+            xaero.map.mods.SupportXaeroMinimap support, boolean enabled,
+            net.minecraft.registry.RegistryKey<net.minecraft.world.World> dim, String multiworld,
+            int a, int b, xaero.map.gui.GuiMap map, xaero.map.world.MapWorld mapWorld,
+            net.minecraft.registry.Registry<net.minecraft.world.dimension.DimensionType> registry) {
+        if (TownyMapMod.hidePlayerWorldMarkers()) return;
+        support.checkWaypoints(enabled, dim, multiworld, a, b, map, mapWorld, registry);
+    }
+
+    /**
+     * Drops the "Waypoints: x" banner along with the waypoints themselves. GuiMap only draws it when
+     * this returns non-null, so null is all that is needed -- it names the waypoint set of a world the
+     * map is not showing, which was the confusing part.
+     */
+    @Redirect(require = 0, remap = false, method = "extractRenderState",
+            at = @At(value = "INVOKE",
+                    target = "Lxaero/map/mods/SupportXaeroMinimap;"
+                           + "getSubWorldNameToRender()Ljava/lang/String;"))
+    private String townymap$hideSubWorldLabelOffWorld(xaero.map.mods.SupportXaeroMinimap support) {
+        return TownyMapMod.hidePlayerWorldMarkers() ? null : support.getSubWorldNameToRender();
+    }
+
+    private void jumpTo(TownData town) {
+        if (town == null) return;
+        TownyMapMod.suppressNextPanClear();   // centring on a selected result isn't a user pan
+        attachedCamera = false;               // same reason as above: a locked camera undoes this
+        double dimScale = TownyMapMod.worldMapCoordinateScale();
+        cameraX = town.centerX() / dimScale;
+        cameraZ = town.centerZ() / dimScale;
+    }
+
+    private void jumpTo(MapJumpTarget target) {
+        if (target == null) return;
+        TownyMapMod.suppressNextPanClear();   // centring on a selected result isn't a user pan
+        attachedCamera = false;               // same reason as above: a locked camera undoes this
+        double dimScale = TownyMapMod.worldMapCoordinateScale();
+        cameraX = target.x() / dimScale;
+        cameraZ = target.z() / dimScale;
+        zoomToFit(target, dimScale);
+        TownyMapMod.flashSearchTarget(target);
+    }
+
+    /**
+     * Picks a zoom that frames the target's claim with room to spare.
+     *
+     * <p>Centring alone left the result at whatever zoom the map happened to be at, so searching a town
+     * from full zoom-out landed you on a claim three pixels wide. The fit uses a deliberately small share
+     * of the screen so you get the outline AND its surroundings, and it is clamped at the top end so a
+     * one-chunk town doesn't slam the map to maximum magnification.
+     */
+    private void zoomToFit(MapJumpTarget target, double dimScale) {
+        if (target == null || !target.hasExtent() || dimScale <= 0) return;
+        if (TownyMapMod.getConfig() == null || !TownyMapMod.getConfig().searchZoomToFit) return;
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc == null || mc.getWindow() == null) return;
+        int w = mc.getWindow().getScaledWidth();
+        int h = mc.getWindow().getScaledHeight();
+        // Only part of the screen is usable: the search panel owns one side and the result list the other,
+        // and "plus more" means the claim shouldn't reach the edges either way.
+        double availW = Math.max(40.0, w * USABLE_SCREEN_FRACTION);
+        double availH = Math.max(40.0, h * USABLE_SCREEN_FRACTION);
+        // Padding in blocks, so a small claim still arrives with a meaningful ring of land around it.
+        double spanX = (target.spanX() + FIT_PADDING_BLOCKS) / dimScale;
+        double spanZ = (target.spanZ() + FIT_PADDING_BLOCKS) / dimScale;
+        if (spanX <= 0 || spanZ <= 0) return;
+        double fit = Math.min(availW / spanX, availH / spanZ);
+        if (!Double.isFinite(fit) || fit <= 0) return;
+        // No floor of our own: Xaero re-clamps destScale every frame, including the looser World Map
+        // Overview floor, so asking for more zoom-out than it allows simply lands on its limit.
+        applyZoomTarget(Math.min(MAX_FIT_SCALE, fit));
+    }
+
+    /**
+     * Writes Xaero's zoom target and lets its own 100ms ease carry the map there.
+     *
+     * <p>Reflective, not {@code @Shadow}, on purpose. A shadowed field that Xaero renames fails the
+     * whole mixin at load time -- and this mixin carries every world-map overlay the mod draws, so one
+     * rename would take the entire addon off the map rather than just the zoom. Xaero has already moved
+     * zoom internals once (the zoom-out floor went from {@code changeZoom} to {@code applyZoomLimits} in
+     * 1.42.0). This degrades to "the jump centres but doesn't zoom" instead.
+     */
+    private void applyZoomTarget(double target) {
+        try {
+            Class<?> self = getClass();
+            if (townymap$destScaleField == null) {
+                townymap$destScaleField = townymap$findField(self, "destScale");
+            }
+            if (townymap$destScaleField == null) {
+                logOnce(ZOOM_FIELD_ERROR_LOGGED, "Xaero's world-map zoom target field is gone; "
+                        + "search jumps will centre without zooming", null);
+                return;
+            }
+            townymap$destScaleField.setDouble(null, target);   // static on Xaero's side
+            // Xaero treats any zoom that isn't method 2 (its own zoom buttons) as "zoom towards the
+            // cursor" and drags the camera that way on every frame the scale grows -- which pulled a
+            // centred jump straight back off the thing it had just centred on.
+            if (townymap$lastZoomMethodField == null) {
+                townymap$lastZoomMethodField = townymap$findField(self, "lastZoomMethod");
+            }
+            if (townymap$lastZoomMethodField != null) townymap$lastZoomMethodField.setInt(this, 2);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            logOnce(ZOOM_FIELD_ERROR_LOGGED, "Failed to set Xaero's world-map zoom for a search jump", e);
+        }
+    }
+
+    /** Looks a field up by name anywhere in the hierarchy, so no runtime class name is hardcoded. */
+    private static java.lang.reflect.Field townymap$findField(Class<?> from, String name) {
+        for (Class<?> c = from; c != null && c != Object.class; c = c.getSuperclass()) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f;
+            } catch (NoSuchFieldException | RuntimeException ignored) {
+                // Keep walking up: Xaero's GuiMap extends its own screen base.
+            }
+        }
+        return null;
+    }
+
+    @org.spongepowered.asm.mixin.Unique
+    private static volatile java.lang.reflect.Field townymap$destScaleField;
+    @org.spongepowered.asm.mixin.Unique
+    private static volatile java.lang.reflect.Field townymap$lastZoomMethodField;
+    private static final AtomicBoolean ZOOM_FIELD_ERROR_LOGGED = new AtomicBoolean(false);
+
+    /** Share of each screen axis a framed claim is allowed to fill. */
+    private static final double USABLE_SCREEN_FRACTION = 0.6;
+    /** Blocks of breathing room added around a framed claim before the zoom is computed. */
+    private static final double FIT_PADDING_BLOCKS = 128.0;
+    /** Zoom-in ceiling for a fit, in GUI pixels per block. Beyond this the map is all claim and no context. */
+    private static final double MAX_FIT_SCALE = 1.5;
+
+    private void handleJumpOrRoute(MapJumpTarget target) {
+        if (target == null) return;
+        if (isShiftDown()) {
+            TownyMapMod.createXaeroRoute(target);
+            return;
+        }
+        jumpTo(target);
+    }
+
+    private static boolean isShiftDown() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc == null || mc.getWindow() == null) return false;
+        long handle = mc.getWindow().getHandle();
+        return GLFW.glfwGetKey(handle, GLFW.GLFW_KEY_LEFT_SHIFT) == GLFW.GLFW_PRESS
+                || GLFW.glfwGetKey(handle, GLFW.GLFW_KEY_RIGHT_SHIFT) == GLFW.GLFW_PRESS;
+    }
+
+
+    @org.spongepowered.asm.mixin.Unique
+    private void townymap$setSmallWidgetsVisible(boolean visible) {
+        try {
+            MinecraftClient mc = MinecraftClient.getInstance();
+            if (mc == null || mc.getWindow() == null) return;
+            int sw = mc.getWindow().getScaledWidth();
+            int sh = mc.getWindow().getScaledHeight();
+            for (net.minecraft.client.gui.Element e
+                    : ((net.minecraft.client.gui.screen.Screen) (Object) this).children()) {
+                if (!(e instanceof net.minecraft.client.gui.widget.ClickableWidget w)) continue;
+                if (w.getWidth() > sw * TOWNYMAP_MAX_HIDEABLE_FRACTION
+                        || w.getHeight() > sh * TOWNYMAP_MAX_HIDEABLE_FRACTION) {
+                    continue;   // too big to be a button; leave it alone
+                }
+                w.visible = visible;
+            }
+        } catch (Exception ignored) {
+            // Best-effort: Xaero draws most of its map UI itself rather than as widgets.
+        }
+    }
+
+    private static void logOnce(AtomicBoolean flag, String message, Exception e) {
+        if (flag.compareAndSet(false, true)) {
+            LOGGER.warn("[TownyMap] {}", message, e);
+        }
+    }
+
+    private static void disableDepthTestIfAvailable() {
+        for (String className : new String[]{
+                "com.mojang.blaze3d.opengl.GlStateManager",
+                "com.mojang.blaze3d.platform.GlStateManager"
+        }) {
+            try {
+                Class<?> stateManager = Class.forName(className);
+                stateManager.getMethod("_disableDepthTest").invoke(null);
+                return;
+            } catch (ReflectiveOperationException | RuntimeException | LinkageError ignored) {
+            }
+        }
+    }
+
+    /**
+     * No-op on current Xaero: {@code xaero.lib.client.graphics.util.TextureUtils} is absent from both
+     * the 26.4.2 minimap and 1.44.2 world map jars, so the loop below never finds a match. Kept because
+     * it costs nothing and would start working again if the class returns; the arrow no longer depends
+     * on it either way, since we draw our own unconditionally.
+     */
+    private static void clearDepthForXaeroArrowIfAvailable() {
+        try {
+            Object framebuffer = MinecraftClient.getInstance().getFramebuffer();
+            Class<?> textureUtils = Class.forName("xaero.lib.client.graphics.util.TextureUtils");
+            for (Method method : textureUtils.getMethods()) {
+                if (!"clearRenderTargetDepth".equals(method.getName()) || method.getParameterCount() != 2) continue;
+                Class<?>[] params = method.getParameterTypes();
+                if (!params[0].isInstance(framebuffer) || params[1] != float.class) continue;
+                method.invoke(null, framebuffer, 1.0F);
+                return;
+            }
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError ignored) {
+        }
+    }
+}

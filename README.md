@@ -1,53 +1,52 @@
-# EarthMC-Map-Addon-Chinese
-EarthMC Map Addon 非官方汉化版 26.1.2 Fabric
-这是一个 Xaero的世界地图 和 Xaero的小地图 的客户端 EarthMC 地图扩展模组。它将 EarthMC 的 Towny 插件数据直接覆盖到地图上，这样就可以在不离开游戏的情况下读取城镇、国家、玩家、边界和声明。
+EarthMC Map Addon is a client-side EarthMC map extension for Xaero’s World Map and Xaero’s Minimap. It overlays EarthMC Towny data directly onto your in-game maps, making it much easier to read towns, nations, players, borders, claims, and useful Towny status information without leaving Minecraft.
 
-世界地图
+## Features
 
-城镇领土被绘制为真实的领土形状，具有可配置的边框厚度、填充不透明度和平滑的轮廓。
-Squaremap 背景图层 — 在叠加层下渲染的真实 map.earthmc.net 平铺视图，带有可选的背景压暗。
-国家的首都星形，可切换。
-国家加入范围 — 圆圈显示城镇可以加入国家的位置（城镇半径 1,500 个城镇半径，国家半径 5,000 个），当附近城镇扩大国家范围时，会显示联合轮廓。
-世界地图概览 — 缩小超出 Xaero 的正常限制以查看整个世界。 远距离缩放城镇点，以便在缩小时城镇仍可见。
-现实世界的国家和州边界能够作为叠加层。
-自定义叠加层 — 将 GeoJSON FeatureCollections（LineString、MultiLineString、Point）放入 mod 创建并打开的文件夹中。
+- Displays EarthMC town claims on Xaero’s World Map.
+- Optional Squaremap background layer for a fuller EarthMC map view.
+- Right-click town info popup with mayor, nation, residents (with inactive-resident count), gold, claimed chunk count, open/public status, and founded date.
+- Info panel under the minimap: your current town & nation, nearby players with live distance (a player who leaves view stays listed in red at their last-known spot briefly), and the nearest town when you're in the wilderness — each line individually toggleable. It anchors below Xaero's own info so it never overlaps.
+- Search for towns, nations, and players from the map UI.
+- Nation search includes capital, king, residents, nation bonus, chunk count, balance, outlaws, and enemies.
+- Player search can show online, offline, hidden, last-known, town, nation, and role information when available.
+- Favorite towns and quickly jump back to them from the map toolbar.
+- Create Xaero waypoint routes to towns and selected map targets.
+- Online player dots on the world map and minimap, colored by relation:
+  - Town members
+  - Nation members
+  - Other players
+- Configurable player name and town/nation label visibility ranges.
+- Nation capital stars.
+- Real-world country and state border overlays for EarthMC.
+- Configurable border thickness and town fill opacity.
+- Town status map modes: public towns, open towns, towns for sale, and towns without nations.
+- Optional RGB/custom-color status highlighting.
+- Persistent multi-group chunk counter for planning claims or regions.
+- Right-click drag selection for chunk counting.
+- Minimap town overlays, town names, player dots, chunk grid options, and Squaremap support.
+- Wilderness player alert for nearby outsiders on the minimap.
+- Optional hiding of the minimap in the Nether.
+- Searchable, sectioned Mod Menu settings screen (General / Minimap / World Map / Players / Info Display / Advanced) with a per-row Reset button and right-click to cycle a setting backward.
+- EarthMC-only mode so the addon only activates on servers containing `earthmc.net`.
+- `/townymap refresh` command to manually refresh town claims.
+- Client commands for quickly toggling towns, players, and Squaremap background.
 
-小地图
+## Commands
 
-将会显示小地图上的城镇边界、城镇名称和玩家点。
-小地图下的信息面板：当前的城镇和国家、附近的实时距离玩家（离开视野的玩家在最后已知的位置上停留在红色）、荒野中最近的城镇。每行独立切换并堆叠在 Xaero 自己的信息下方，不会重叠。
-将对荒野玩家对附近的外来者发出警告。
-可选的隐藏下界，或“下界中的 EarthMC 地图”模式，可将主世界地图在下界平铺视图上缩放八倍。
+- `/townymap refresh`  
+  Refreshes town claims from EarthMC/Squaremap.
 
-地图模式
+- `/townymap towns true|false`  
+  Enables or disables town borders.
 
-六种状态模式：公开、超占、开放、大联盟、联盟和规划。前三个以您选择的颜色突出显示匹配的城镇（固定或 RGB 循环）；超级大国和联盟按所属重新为城镇着色，使用 BreakTheBot Alliance API。
-规划模式将搜索栏变成国家选择器，并让您可以使用编号的地图标记放置预期的城镇（T1、T2...）。国家范围之外的城镇在缺口和地图上都被标记为红色。
-搜索
-城镇、国家、玩家和联盟，带有详细面板 - 国家奖励、国王/首都、通缉犯、敌人、居民列表、玩家在线/最后出现/城镇/国家/角色。
-过滤器：nationless，n:germany,france（多值），r>30,<60，chunks>500。支持短前缀 n: 和 r:。
-存档查找 — 输入 dd/mm/yyyy 日期以从 Wayback Machine 加载历史地图数据。最早的日期是 2026 年 4 月 17 日，因为那是 Nostra 周目开始的时间。分隔符可以是 / 、.、,、-或空格。前导零是可选的，年份可以是 2 或 4 位数字（17 4 26 是可以的）。
-平移时过滤器仍然存在；框自动​​变宽。
-城镇、国家、玩家和联盟的最爱 - 跳转到国家首都或在线玩家的位置。
+- `/townymap players true|false`  
+  Enables or disables online player rendering.
 
-玩家
+- `/townymap squaremap-background true|false`  
+  Enables or disables the Squaremap background layer.
 
-两张地图上的在线玩家点按关系（您的城镇/您的国家/其他）、真实玩家头部、可配置的头部/名称/标签范围以及最后看到的位置着色。
-信息面板
-单击国家的星形可获取首都、成立日期、国家块、城镇等信息。
-单击玩家的头像或点即可获取有关玩家的信息。
-以上两个都有扩展模式，包含更深入的信息。
+## Notes
 
-工具
+This mod is made specifically for EarthMC and is designed to work with Xaero’s World Map and Xaero’s Minimap. Most data is pulled from EarthMC’s public map/API data and cached or refreshed automatically while playing.
 
-具有持续多组跟踪和 Shift+右键拖动框选择功能的区块计数器。
-Xaero 导航点路线至地图目标。
-键绑定上的地图屏幕截图 - 捕获方形地图、城镇和玩家图层，隐藏 mod 和 Xaero UI，具有自己的设置部分（玩家关闭、国家星形开启、默认情况下隐藏的暗淡城镇）并且没有块光标。
-配置
-通过 Mod Menu 可搜索分段设置屏幕，并具有每行重置和右键返回功能；用户界面规模；深色按钮；仅 EarthMC 模式；用于刷新边界、刷新地图模式、刷新城镇、切换块计数器、切换方形地图和地图屏幕截图（与 Minecraft 的控制屏幕同步）的按键绑定。
-
-前置模组
-
-1.Fabric Loader 与 Fabric API。
-2.Xaero's Minimap 与 Xaero's World Map 均可选，但必须安装其中一个否则该模组不会有任何作用。这模组对于这两个模组配置里写的是 suggests，但是不安装这个模组就没用了。强烈建议模组作者把这个改成 depends
-3.Mod Menu（可选，用于模组的设置）。
+The town "X / max claims" display and the Overclaim map mode are temporarily disabled: EarthMC's API currently counts inactive residents toward a town's claim limit, so the calculated maximum is wrong. They will return once the API exposes active-resident counts (expected in ~2 weeks). The town info popup shows the actual claimed chunk count in the meantime.

@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "townymapaddon",
+  "version": "${version}",
+  "name": "EarthMC Map Addon 中文版",
+  "description": "在 Xaero 的世界地图/小地图上叠加 EarthMC Towny 的城镇边界与在线玩家（简体中文版）。",
+  "authors": ["JR1258"],
+  "contact": {
+    "homepage": "https://modrinth.com/mod/emcmap-addon",
+    "sources": "https://github.com/JR1258/EarthMC-Map-Addon",
+    "issues": "https://github.com/JR1258/EarthMC-Map-Addon/issues"
+  },
+  "icon": "assets/townymapaddon/icon.png",
+  "license": "Apache-2.0",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["net.townymap.TownyMapMod"],
+    "modmenu": ["net.townymap.gui.TownyMapModMenuIntegration"]
+  },
+  "mixins": [
+    "townymapaddon.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.15.0",
+    "fabric-api":   "*",
+    "minecraft":    "1.21.11",
+    "xaerominimap":  "${xaerominimap_version}",
+    "xaeroworldmap": "${xaeroworldmap_version}"
+  },
+  "suggests": {
+    "modmenu": "*"
+  },
+  "custom": {
+    "modmenu": {
+      "update_checker": false
+    }
+  }
+}
