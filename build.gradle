@@ -1,0 +1,197 @@
+plugins {
+    id 'net.fabricmc.fabric-loom' version '1.16-SNAPSHOT'
+    id 'maven-publish'
+}
+
+version = project.mod_version
+group   = project.maven_group
+base { archivesName = "${project.archives_base_name}-${project.minecraft_version}" }
+
+repositories {
+    maven { url 'https://maven.fabricmc.net/' }
+    maven { url 'https://maven.terraformersmc.com/releases/' }
+    // Xaero's mods — place the Fabric 1.21.x JARs into libs/
+    flatDir { dirs 'libs' }
+}
+
+dependencies {
+    minecraft        "com.mojang:minecraft:${project.minecraft_version}"
+    // MC 26.x ships unobfuscated (Mojang no longer publishes obfuscation maps and
+    // there is no yarn for 26.x), so Loom 1.16 reads names from the jar directly —
+    // no `mappings` dependency is declared.
+    // Loom 1.16 dropped the mod* remapping configs (unobfuscated 26.x needs no
+    // remap), so these are plain Gradle configurations.
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // Optional: ModMenu for in-game config screen. Adjust version to match your MC version.
+    compileOnly "com.terraformersmc:modmenu:${project.modmenu_version}"
+
+    // Compile-only: users must have Xaero's mods installed at runtime.
+    compileOnly fileTree(dir: 'libs', include: ['*.jar'])
+}
+
+// The border source JSONs live in tools/border-source and are NOT shipped: they are build inputs only.
+// encodeBorders turns them into one compact binary blob (~0.9 MB vs 11.3 MB of text) that the mod reads.
+def borderCountriesJson = 'tools/border-source/borders.nostra.countries.json'
+def borderStatesJson    = 'tools/border-source/borders.nostra.states-and-countries.json'
+
+// Minimum Xaero version we declare a dependency on, read from the jar in libs/ that we actually
+// compile against. Pinning a number by hand drifts: a user on a Xaero too old for our mixins got a
+// silently half-working mod rather than a clear "update Xaero" at launch, which cost three support
+// rounds. Falls back to "*" if the jar is absent so a fresh clone still builds.
+ext.xaeroFloor = { String prefix ->
+    def jar = fileTree('libs').matching { include "${prefix}-*.jar" }.files.sort { it.name }.find { true }
+    if (jar == null) return "*"
+    def zip = new java.util.zip.ZipFile(jar)
+    try {
+        def entry = zip.getEntry("fabric.mod.json")
+        if (entry == null) return "*"
+        return ">=" + new groovy.json.JsonSlurper().parse(zip.getInputStream(entry)).version
+    } finally {
+        zip.close()
+    }
+}
+
+processResources {
+    dependsOn 'encodeBorders'
+    inputs.property "version", project.version
+    inputs.property "xaeroworldmap_version", xaeroFloor("xaeroworldmap-fabric")
+    inputs.property "xaerominimap_version", xaeroFloor("xaerominimap-fabric")
+    filteringCharset 'UTF-8'
+    from(layout.buildDirectory.dir("generated/resources/borders"))
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version,
+               "xaeroworldmap_version": xaeroFloor("xaeroworldmap-fabric"),
+               "xaerominimap_version": xaeroFloor("xaerominimap-fabric")
+    }
+}
+
+tasks.register('compileEncodeBorders', JavaCompile) {
+    source = fileTree('tools') { include 'EncodeBorders.java' }
+    destinationDirectory = layout.buildDirectory.dir('tools/encoder-classes')
+    classpath = files()
+    sourceCompatibility = '21'
+    targetCompatibility = '21'
+}
+
+tasks.register('encodeBorders', JavaExec) {
+    dependsOn 'compileEncodeBorders'
+    inputs.file borderCountriesJson
+    inputs.file borderStatesJson
+    inputs.file 'tools/EncodeBorders.java'
+    outputs.dir layout.buildDirectory.dir('generated/resources/borders/assets/townymapaddon/borders')
+    classpath = files(layout.buildDirectory.dir('tools/encoder-classes'))
+    mainClass = 'EncodeBorders'
+    doFirst {
+        delete layout.buildDirectory.dir('generated/resources/borders')
+    }
+    args file(borderCountriesJson).absolutePath,
+         file(borderStatesJson).absolutePath,
+         layout.buildDirectory.dir('generated/resources/borders').get().asFile.absolutePath
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = name == 'compileEncodeBorders' ? 21 : 25
+    // 源码含中文字面量，必须显式用 UTF-8 编译
+    options.encoding = 'UTF-8'
+}
+
+jar {
+    from("LICENSE") {
+        rename { "${it}_${project.archives_base_name}" }
+    }
+}
+
+// Automatically deploy the remapped JAR to the Modrinth launcher profile after build.
+def modsDir = file(new File(System.getProperty("user.home"), "Library/Application Support/ModrinthApp/profiles/26.1.2 (1)/mods"))
+def oldModJarPrefixes = ['towny-map-addon', 'EarthMC Map Addon', 'EarthMC.Map.Addon', 'earthmc-map-addon']
+def modrinthLauncherDb = file(new File(System.getProperty("user.home"), "Library/Application Support/ModrinthApp/app.db"))
+
+def commandResult = { List<String> args, String stdin = null ->
+    def process = new ProcessBuilder(args.collect { it.toString() }).start()
+    if (stdin != null) {
+        process.outputStream.withWriter('UTF-8') { writer -> writer << stdin }
+    } else {
+        process.outputStream.close()
+    }
+    def output = new ByteArrayOutputStream()
+    def error = new ByteArrayOutputStream()
+    process.inputStream.transferTo(output)
+    process.errorStream.transferTo(error)
+    [exitValue: process.waitFor(), output: output.toString('UTF-8').trim()]
+}
+
+def commandOutput = { List<String> args ->
+    def result = commandResult(args)
+    result.exitValue == 0 ? result.output : null
+}
+
+def sqlEscape = { String value ->
+    value.replace("'", "''")
+}
+
+def registerModrinthLauncherFile = { File deployedJar ->
+    if (!deployedJar.isFile() || !modrinthLauncherDb.isFile()) return
+    if (commandOutput(['which', 'sqlite3']) == null ||
+        commandOutput(['which', 'curl']) == null ||
+        commandOutput(['which', 'shasum']) == null) {
+        return
+    }
+
+    def shaLine = commandOutput(['shasum', '-a', '1', deployedJar.absolutePath])
+    def sha1 = shaLine?.tokenize()?.first()
+    if (!sha1) return
+
+    def requestBody = groovy.json.JsonOutput.toJson([hashes: [sha1], algorithm: 'sha1'])
+    def lookup = commandResult([
+            'curl', '-sS', '-X', 'POST', 'https://api.modrinth.com/v2/version_files',
+            '-H', 'Content-Type: application/json',
+            '--data-binary', '@-'
+    ], requestBody)
+    if (lookup.exitValue != 0) return
+
+    def versions = new groovy.json.JsonSlurper().parseText(lookup.output)
+    def version = versions[sha1]
+    if (!version?.project_id || !version?.id) return
+
+    def data = groovy.json.JsonOutput.toJson([
+        hash: sha1,
+        project_id: version.project_id,
+        version_id: version.id
+    ])
+    def expires = ((System.currentTimeMillis() / 1000L) as long) + 60L * 60L * 24L * 30L
+    def sql = "INSERT OR REPLACE INTO cache (id,data_type,alias,data,expires) VALUES ('${sqlEscape(sha1)}','file',NULL,'${sqlEscape(data)}',${expires});"
+    def update = commandResult(['sqlite3', modrinthLauncherDb.absolutePath, sql])
+    if (update.exitValue == 0) {
+        println "Registered ${deployedJar.name} with Modrinth launcher metadata (${version.project_id}/${version.id})."
+    }
+}
+
+tasks.register('deployToMods', Copy) {
+    // Loom 1.16 produces the final mod jar via the `jar` task (no remap step on
+    // unobfuscated 26.x), so deploy from `jar` rather than `remapJar`.
+    dependsOn jar
+    from(jar.archiveFile)
+    into(modsDir)
+    // Remove any older version of this mod so there are no duplicates
+    doFirst {
+        modsDir.listFiles()?.each { f ->
+            if (oldModJarPrefixes.any { prefix -> f.name.startsWith(prefix) }) f.delete()
+        }
+    }
+    doLast {
+        def deployedJar = new File(modsDir, jar.archiveFileName.get())
+        println "Deployed ${jar.archiveFileName.get()} → ${modsDir}"
+        registerModrinthLauncherFile(deployedJar)
+    }
+}
+
+build.finalizedBy(deployToMods)
