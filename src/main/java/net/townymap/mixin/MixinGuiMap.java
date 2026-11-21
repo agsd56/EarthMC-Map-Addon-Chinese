@@ -34,15 +34,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Injects into Xaero's GuiMap.
  *
- * Rendering order inside extractRenderState (Screen.render):
- *   1. renderPreDropdown — waypoints, labels, town overlays (HEAD/RETURN inject here)
- *   2. Squaremap tile compositing (GuiGraphicsExtractor flush in onBeforePlayerArrow)
- *   3. Xaero's player arrow (drawArrowOnMap via vertex buffers)
- *   4. extractRenderState RETURN — our arrow re-draw fires here, guaranteed on top of tiles
+ * What governs layering here is NOT the order of these injects. Everything we draw goes through
+ * GuiGraphicsExtractor, which records into GuiRenderState and is composited after the whole screen
+ * render; everything Xaero draws goes through XaeroBufferProvider.endBatch, which uploads and renders
+ * on the spot. So our layer covers Xaero's terrain, its map elements and its waypoints alike, from any
+ * injection point in extractRenderState. Moving an inject earlier or later cannot change that, and a
+ * 1.4.11 attempt to fix the buried waypoints that way achieved nothing.
  *
- * Town overlays and info UI render at renderPreDropdown HEAD (clean matrix state).
- * The player arrow MUST render at extractRenderState RETURN so it lands after the
- * squaremap GuiGraphicsExtractor flush, not before it.
+ * Anything of Xaero's that has to stay visible under our layer must therefore be drawn again by us,
+ * through ctx, in the renderPreDropdown pass. That is what the player arrow has always done, what the
+ * minimap does for its waypoints, and what WorldMapWaypoints now does for the world map's.
  *
  * mouseClicked = mouseClicked(MouseButtonEvent, boolean) in MC 1.21.11.
  */
@@ -76,18 +77,35 @@ public abstract class MixinGuiMap {
      */
     @Shadow(remap = false) private boolean shouldResetCameraPos;
 
+    /**
+     * Whatever map element of Xaero's the cursor was over on the last frame it drew -- a waypoint, a
+     * tracked player. Xaero keeps it for exactly this purpose: mouseClicked copies it into
+     * viewedOnMousePress and the right-click menu is built from it.
+     */
+    @Shadow(remap = false) private xaero.map.element.HoveredMapElementHolder<?, ?> viewed;
+
     @Shadow(remap = false) private double cameraX;
     @Shadow(remap = false) private double cameraZ;
     @Shadow(remap = false) private double scale;
     @Shadow(remap = false) private double screenScale;
 
-    // ── All overlay rendering at HEAD (clean GL/matrix state) ─────────────────
+    // ── All overlay rendering in one pass ───────────────────────────────
 
-    @Inject(require = 0, 
+    /**
+     * Draws our map surface, anchored on the ARROW config read, late in extractRenderState.
+     *
+     * <p>1.4.11 briefly moved this to just before Xaero's map-element pass, expecting that to let its
+     * waypoints land on top. It could not, for the reason in this class's header. What the move did
+     * change is that our deferred flush and depth-test disable began running BEFORE Xaero's element
+     * pass rather than after it -- no benefit, and our GL fiddling newly upstream of code that had
+     * never run after it. Back where it was.
+     */
+    @Inject(require = 0,
             method = "extractRenderState",
             at = @At(
                     value = "FIELD",
-                    target = "Lxaero/map/common/config/option/WorldMapProfiledConfigOptions;ARROW:Lxaero/lib/common/config/option/BooleanConfigOption;",
+                    target = "Lxaero/map/common/config/option/WorldMapProfiledConfigOptions;ARROW:"
+                           + "Lxaero/lib/common/config/option/BooleanConfigOption;",
                     opcode = Opcodes.GETSTATIC,
                     shift = At.Shift.BEFORE
             ),
@@ -98,7 +116,7 @@ public abstract class MixinGuiMap {
         // Clear the search bar when the map is reopened (new GuiMap instance) or panned. Tracked on the
         // raw camera every frame, regardless of dimension. jumpTo() suppresses the next pan-clear so that
         // centre-on-select doesn't wipe the bar.
-        TownyMapMod.noteWorldMapInjectAlive();
+        TownyMapMod.noteWorldMapSurfaceAlive();
         TownyMapMod.onWorldMapFrame(this, cameraX, cameraZ);
         // A world switch leaves the camera at coordinates belonging to the world we left. Re-aim before
         // anything is drawn, and suppress the pan-clear so it does not read as the user panning.
@@ -152,6 +170,23 @@ public abstract class MixinGuiMap {
                 : original;
     }
 
+    /**
+     * Liveness only, so the health check has a signal that does not depend on what Xaero decides to
+     * draw.
+     *
+     * <p>The other two pings sit where they happened to be useful: one at the player-arrow field read,
+     * which Xaero skips entirely when the map UI is hidden, and one in renderPreDropdown. Anchoring
+     * "are our hooks alive?" on either meant a normal Xaero setting could make us announce that Xaero
+     * was incompatible. This one is at the head of the method the whole overlay hangs off, so it fires
+     * on every frame the map draws, and stops only when the thing we actually depend on has moved --
+     * which is exactly what the check is for.
+     */
+    @Inject(require = 0, method = "extractRenderState", at = @At("HEAD"), remap = false)
+    private void onExtractRenderStateHead(GuiGraphicsExtractor ctx, int mouseX, int mouseY,
+                                          float delta, CallbackInfo ci) {
+        TownyMapMod.noteWorldMapInjectAlive();
+    }
+
     @Inject(require = 0, method = "renderPreDropdown", at = @At("HEAD"), remap = false)
     private void onRenderPreDropdown(GuiGraphicsExtractor ctx, int mouseX, int mouseY,
                                      float delta, CallbackInfo ci) {
@@ -196,6 +231,16 @@ public abstract class MixinGuiMap {
                 double mapScale = guiScale / dimMul;
                 TownyMapMod.renderWorldMapLatePass(ctx, cameraX * dimMul, cameraZ * dimMul, mapScale, w, h);
             }
+            // Xaero's waypoints, over our layer. Xaero draws them into its own vertex buffers, which are
+            // flushed during this render call, while everything we draw is recorded into GuiRenderState
+            // and composited after it -- so our layer covers them wherever it is injected, and the only
+            // way they survive is for us to draw them too. Xaero's own camera and scale: the waypoint
+            // coordinates are in that space, and re-deriving them through the overlay's would only be a
+            // chance to get it wrong.
+            double xaeroScale = (screenScale > 0) ? scale / screenScale : scale;
+            if (xaeroScale > 0.0) {
+                TownyMapMod.renderWorldMapWaypoints(ctx, cameraX, cameraZ, xaeroScale, w, h);
+            }
             // A clean map screenshot skips our own chrome for the frame, so the capture is just the map.
             if (!TownyMapMod.hideChromeForScreenshot()) {
                 double[] world = overlayWorldFromScreen(mouseX, mouseY, w, h);
@@ -229,7 +274,7 @@ public abstract class MixinGuiMap {
     /**
      * Applies a pending world-switch recentre.
      *
-     * <p>Called from both injects on purpose. onBeforePlayerArrow anchors on a field access late in
+     * <p>Called from both injects on purpose. onBeforePlayerArrow anchors on a field access in
      * extractRenderState, and that anchor has silently stopped matching across Xaero updates before;
      * renderPreDropdown is the anchor the whole overlay already depends on, so if the map is drawing at
      * all this one runs. consumeWorldMapRecentre() clears itself, so whichever fires first wins.
@@ -472,6 +517,13 @@ public abstract class MixinGuiMap {
             }
             if (button != 1) return;
 
+            // A right-click on one of Xaero's own map elements belongs to Xaero. Its waypoint menu --
+            // edit, delete, teleport, share -- is only opened from mouseReleased, and only if
+            // mouseClicked ran far enough to set rightMouseButton.isDown, so consuming the click here is
+            // what left waypoints standing on claimed land looking inert: the town panel opened instead
+            // and the waypoint could not be touched at all.
+            if (viewed != null && viewed.isRightClickValid()) return;
+
             double[] world = overlayWorldFromScreen(click.x(), click.y(), sw, sh);
             if (world == null) return;
 
@@ -482,10 +534,38 @@ public abstract class MixinGuiMap {
                 return;
             }
 
-            TownyMapMod.onMapRightClick(world[0], world[1], (int) click.x(), (int) click.y());
-            cir.setReturnValue(true);
+            // Consumed only if the click landed on a claim. Xaero opens its own right-click menu --
+            // add waypoint here, teleport, share location -- from mouseReleased, and only when
+            // mouseClicked got as far as setting rightMouseButton.isDown and recording rightClickX/Y/Z.
+            // Returning true for every right-click meant none of that ever ran, which left the world
+            // map with no way at all to create a waypoint.
+            if (TownyMapMod.onMapRightClick(world[0], world[1], (int) click.x(), (int) click.y())) {
+                cir.setReturnValue(true);
+            }
         } catch (Exception e) {
             logOnce(CLICK_ERROR_LOGGED, "Failed to handle Xaero world-map click", e);
+        }
+    }
+
+    /**
+     * The search bar's hint/history stack scrolls on the wheel.
+     *
+     * <p>Cancels only when the overlay says the cursor was on the stack; every other wheel event falls
+     * through to Xaero, which zooms the map. Swallowing one near the middle of the screen for any other
+     * reason would make the map feel broken.
+     */
+    @Inject(require = 0, method = "mouseScrolled", at = @At("HEAD"), remap = false, cancellable = true)
+    private void onMouseScrolled(double mouseX, double mouseY, double horizontal, double vertical,
+                                 CallbackInfoReturnable<Boolean> cir) {
+        if (TownyMapMod.isAccessBlocked()) return;   // let Xaero handle it as if we were not installed
+        try {
+            Minecraft mc = Minecraft.getInstance();
+            int sw = mc.getWindow().getGuiScaledWidth();
+            if (TownyMapMod.onTownSearchScroll(mouseX, mouseY, vertical, sw)) {
+                cir.setReturnValue(true);
+            }
+        } catch (Exception e) {
+            logOnce(CLICK_ERROR_LOGGED, "Failed to handle Xaero world-map scroll", e);
         }
     }
 
@@ -628,7 +708,99 @@ public abstract class MixinGuiMap {
         double dimScale = TownyMapMod.worldMapCoordinateScale();
         cameraX = target.x() / dimScale;
         cameraZ = target.z() / dimScale;
+        zoomToFit(target, dimScale);
+        TownyMapMod.flashSearchTarget(target);
     }
+
+    /**
+     * Picks a zoom that frames the target's claim with room to spare.
+     *
+     * <p>Centring alone left the result at whatever zoom the map happened to be at, so searching a town
+     * from full zoom-out landed you on a claim three pixels wide. The fit uses a deliberately small share
+     * of the screen so you get the outline AND its surroundings, and it is clamped at the top end so a
+     * one-chunk town doesn't slam the map to maximum magnification.
+     */
+    private void zoomToFit(MapJumpTarget target, double dimScale) {
+        if (target == null || !target.hasExtent() || dimScale <= 0) return;
+        if (TownyMapMod.getConfig() == null || !TownyMapMod.getConfig().searchZoomToFit) return;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || mc.getWindow() == null) return;
+        int w = mc.getWindow().getGuiScaledWidth();
+        int h = mc.getWindow().getGuiScaledHeight();
+        // Only part of the screen is usable: the search panel owns one side and the result list the other,
+        // and "plus more" means the claim shouldn't reach the edges either way.
+        double availW = Math.max(40.0, w * USABLE_SCREEN_FRACTION);
+        double availH = Math.max(40.0, h * USABLE_SCREEN_FRACTION);
+        // Padding in blocks, so a small claim still arrives with a meaningful ring of land around it.
+        double spanX = (target.spanX() + FIT_PADDING_BLOCKS) / dimScale;
+        double spanZ = (target.spanZ() + FIT_PADDING_BLOCKS) / dimScale;
+        if (spanX <= 0 || spanZ <= 0) return;
+        double fit = Math.min(availW / spanX, availH / spanZ);
+        if (!Double.isFinite(fit) || fit <= 0) return;
+        // No floor of our own: Xaero re-clamps destScale every frame, including the looser World Map
+        // Overview floor, so asking for more zoom-out than it allows simply lands on its limit.
+        applyZoomTarget(Math.min(MAX_FIT_SCALE, fit));
+    }
+
+    /**
+     * Writes Xaero's zoom target and lets its own 100ms ease carry the map there.
+     *
+     * <p>Reflective, not {@code @Shadow}, on purpose. A shadowed field that Xaero renames fails the
+     * whole mixin at load time -- and this mixin carries every world-map overlay the mod draws, so one
+     * rename would take the entire addon off the map rather than just the zoom. Xaero has already moved
+     * zoom internals once (the zoom-out floor went from {@code changeZoom} to {@code applyZoomLimits} in
+     * 1.42.0). This degrades to "the jump centres but doesn't zoom" instead.
+     */
+    private void applyZoomTarget(double target) {
+        try {
+            Class<?> self = getClass();
+            if (townymap$destScaleField == null) {
+                townymap$destScaleField = townymap$findField(self, "destScale");
+            }
+            if (townymap$destScaleField == null) {
+                logOnce(ZOOM_FIELD_ERROR_LOGGED, "Xaero's world-map zoom target field is gone; "
+                        + "search jumps will centre without zooming", null);
+                return;
+            }
+            townymap$destScaleField.setDouble(null, target);   // static on Xaero's side
+            // Xaero treats any zoom that isn't method 2 (its own zoom buttons) as "zoom towards the
+            // cursor" and drags the camera that way on every frame the scale grows -- which pulled a
+            // centred jump straight back off the thing it had just centred on.
+            if (townymap$lastZoomMethodField == null) {
+                townymap$lastZoomMethodField = townymap$findField(self, "lastZoomMethod");
+            }
+            if (townymap$lastZoomMethodField != null) townymap$lastZoomMethodField.setInt(this, 2);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            logOnce(ZOOM_FIELD_ERROR_LOGGED, "Failed to set Xaero's world-map zoom for a search jump", e);
+        }
+    }
+
+    /** Looks a field up by name anywhere in the hierarchy, so no runtime class name is hardcoded. */
+    private static java.lang.reflect.Field townymap$findField(Class<?> from, String name) {
+        for (Class<?> c = from; c != null && c != Object.class; c = c.getSuperclass()) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f;
+            } catch (NoSuchFieldException | RuntimeException ignored) {
+                // Keep walking up: Xaero's GuiMap extends its own screen base.
+            }
+        }
+        return null;
+    }
+
+    @org.spongepowered.asm.mixin.Unique
+    private static volatile java.lang.reflect.Field townymap$destScaleField;
+    @org.spongepowered.asm.mixin.Unique
+    private static volatile java.lang.reflect.Field townymap$lastZoomMethodField;
+    private static final AtomicBoolean ZOOM_FIELD_ERROR_LOGGED = new AtomicBoolean(false);
+
+    /** Share of each screen axis a framed claim is allowed to fill. */
+    private static final double USABLE_SCREEN_FRACTION = 0.6;
+    /** Blocks of breathing room added around a framed claim before the zoom is computed. */
+    private static final double FIT_PADDING_BLOCKS = 128.0;
+    /** Zoom-in ceiling for a fit, in GUI pixels per block. Beyond this the map is all claim and no context. */
+    private static final double MAX_FIT_SCALE = 1.5;
 
     private void handleJumpOrRoute(MapJumpTarget target) {
         if (target == null) return;

@@ -40,6 +40,7 @@ public final class TownyMinimapOverlay {
     // town data changes). At 1200 a busy view ran out mid-scan, so towns later in the scan lost their
     // outline entirely and the one at the cutoff got a half-drawn box; which towns lost out shifted as the
     // window snapped while walking, which is what made the borders look glitchy.
+    /** Ceiling on outline runs. Merging put a normal view far below this; it is a backstop, not a budget. */
     private static final int MAX_CHUNK_EDGES_PER_FRAME = 24_000;
     // Cells in the cached chunk mask. Only rebuilt when the window or the town data changes, so this can be
     // generous; at 7000 (~83x83 chunks) a zoomed-out enlarged minimap exceeded it and the overlay bailed out
@@ -56,13 +57,30 @@ public final class TownyMinimapOverlay {
     private static final double MIN_MINIMAP_CHUNK_GRID_SPACING = 3.5;
     private static final int CHUNK_SIZE = 16;
     private static final int MINIMAP_CHUNK_GRID_COLOR = 0xCC000000;
-    private static List<TownData> cachedTownSource = List.of();
-    private static int cachedMinChunkX;
-    private static int cachedMinChunkZ;
-    private static int cachedChunkWidth;
-    private static int cachedChunkHeight;
-    private static VisibleRenderData cachedRenderData =
-            new VisibleRenderData(new TownData[0], List.of(), List.of(), List.of());
+    /**
+     * The mask currently being drawn, together with the window it was built for.
+     *
+     * <p>Published as one object so a reader never sees the data and the window it describes disagree:
+     * the build runs off the render thread, and five separate fields could be read half-updated.
+     */
+    private record MaskSnapshot(List<TownData> towns, int minChunkX, int minChunkZ,
+                                int chunkWidth, int chunkHeight, VisibleRenderData data) {
+        boolean covers(List<TownData> t, int x, int z, int w, int h) {
+            return towns == t && minChunkX == x && minChunkZ == z && chunkWidth == w && chunkHeight == h;
+        }
+    }
+
+    private static volatile MaskSnapshot maskSnapshot;
+    /** One build at a time; a window that moves again is picked up by the next frame's request. */
+    private static final java.util.concurrent.atomic.AtomicBoolean maskBuilding =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static final java.util.concurrent.ExecutorService maskExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "TownyMap minimap mask");
+                t.setDaemon(true);
+                return t;
+            });
+
     private static int lastSyncedXaeroChunkGrid = Integer.MIN_VALUE;
     private static long lastXaeroChunkGridSyncAttemptMs;
     private static long lastMinimapShapeReadAtMs;
@@ -78,6 +96,17 @@ public final class TownyMinimapOverlay {
     private static long cachedWaypointCollectAtMs;
     private static List<Waypoint> cachedMinimapWaypoints = List.of();
     private static boolean lastRenderCanCoverWaypoints;
+
+    /**
+     * Whether this frame's minimap draw actually painted over the terrain, and so over Xaero's
+     * waypoints with it.
+     *
+     * <p>Read by the native-waypoint suppression, which runs after our draw and before Xaero's. The two
+     * have to agree: suppressing a pass we then decline to replace is how waypoints disappear.
+     */
+    public static boolean lastRenderCoveredWaypoints() {
+        return lastRenderCanCoverWaypoints;
+    }
     /**
      * Blocks-per-block factor the minimap was actually drawn at this frame, for the waypoint layer.
      * 1.0 normally. In the Nether with "Overworld Coords" the town overlay and the squaremap tiles are
@@ -91,12 +120,9 @@ public final class TownyMinimapOverlay {
     }
 
     public static void invalidateTownCache() {
-        cachedTownSource = List.of();
-        cachedMinChunkX = 0;
-        cachedMinChunkZ = 0;
-        cachedChunkWidth = 0;
-        cachedChunkHeight = 0;
-        cachedRenderData = new VisibleRenderData(new TownData[0], List.of(), List.of(), List.of());
+        // Dropping it rather than replacing it with an empty one: with nothing to fall back on the next
+        // frame builds inline, so a data swap shows the new claims immediately instead of a blank pass.
+        maskSnapshot = null;
     }
 
     /**
@@ -656,18 +682,65 @@ public final class TownyMinimapOverlay {
         return chunkTowns;
     }
 
+    /**
+     * The chunk mask for the visible window, built off the render thread.
+     *
+     * <p>A rebuild walks every town, rejects by bounding box, then runs a point-in-polygon per chunk for
+     * the ones that overlap -- across a window of up to {@code MAX_CHUNK_CELLS_PER_FRAME} cells. Done
+     * inline that lands entirely on one frame, so the overlay cost nothing on most frames and then
+     * stalled on the one that noticed the window had moved. That is what a stutter is.
+     *
+     * <p>So a miss now starts the build on a worker and keeps drawing the previous window meanwhile.
+     * The window is padded by {@code MINIMAP_RENDER_CACHE_PADDING_CHUNKS} and snapped to a step, which
+     * is the slack that makes this safe: what is already drawn still covers the screen while the new
+     * mask is produced. Same total work, just never on the frame's critical path.
+     *
+     * <p>The first build has nothing to fall back on, so it is paid inline rather than showing an empty
+     * overlay for a few frames.
+     */
     private static VisibleRenderData cachedVisibleRenderData(List<TownData> towns, int minChunkX, int minChunkZ,
                                                              int chunkWidth, int chunkHeight) {
-        if (towns == cachedTownSource
-                && minChunkX == cachedMinChunkX
-                && minChunkZ == cachedMinChunkZ
-                && chunkWidth == cachedChunkWidth
-                && chunkHeight == cachedChunkHeight) {
-            return cachedRenderData;
+        MaskSnapshot snap = maskSnapshot;
+        if (snap != null && snap.covers(towns, minChunkX, minChunkZ, chunkWidth, chunkHeight)) {
+            return snap.data();
         }
+        if (snap == null) {
+            VisibleRenderData built = buildMask(towns, minChunkX, minChunkZ, chunkWidth, chunkHeight);
+            maskSnapshot = new MaskSnapshot(towns, minChunkX, minChunkZ, chunkWidth, chunkHeight, built);
+            return built;
+        }
+        requestMaskBuild(towns, minChunkX, minChunkZ, chunkWidth, chunkHeight);
+        return snap.data();
+    }
 
+    /**
+     * Queues one rebuild. If the window moves again while it runs, the next frame simply asks again --
+     * the flag means only one is ever in flight, so a fast-moving player cannot pile them up.
+     */
+    private static void requestMaskBuild(List<TownData> towns, int minChunkX, int minChunkZ,
+                                         int chunkWidth, int chunkHeight) {
+        if (!maskBuilding.compareAndSet(false, true)) return;
+        try {
+            maskExecutor.execute(() -> {
+                try {
+                    VisibleRenderData built = buildMask(towns, minChunkX, minChunkZ, chunkWidth, chunkHeight);
+                    maskSnapshot = new MaskSnapshot(towns, minChunkX, minChunkZ, chunkWidth, chunkHeight, built);
+                } catch (Throwable ignored) {
+                    // Keep drawing the previous mask; the next frame will ask for this window again.
+                } finally {
+                    maskBuilding.set(false);
+                }
+            });
+        } catch (RuntimeException e) {
+            maskBuilding.set(false);   // executor refused the task (shutting down)
+        }
+    }
+
+    /** The actual work: rasterise the towns covering this window, then derive spans, edges and labels. */
+    private static VisibleRenderData buildMask(List<TownData> towns, int minChunkX, int minChunkZ,
+                                               int chunkWidth, int chunkHeight) {
         // One chunk of margin around the window: without it a town that continues past the edge looks like
-        // it ends there, and a border was drawn along the window boundary — a line that moved with the
+        // it ends there, and a border was drawn along the window boundary -- a line that moved with the
         // window as you walked rather than sitting on the real claim edge.
         int padMinChunkX = minChunkX - EDGE_MARGIN_CHUNKS;
         int padMinChunkZ = minChunkZ - EDGE_MARGIN_CHUNKS;
@@ -678,15 +751,7 @@ public final class TownyMinimapOverlay {
         // meant the minimap showed claims that don't exist -- corridors, notches, and any gap a town
         // happened to surround. The world map never did this, which is why the two disagreed. The chunk
         // mask now reflects the claim data exactly: if a chunk isn't claimed, it isn't drawn as claimed.
-        VisibleRenderData renderData = buildRenderData(chunkTowns, padMinChunkX, padMinChunkZ,
-                padWidth, padHeight, EDGE_MARGIN_CHUNKS);
-        cachedTownSource = towns;
-        cachedMinChunkX = minChunkX;
-        cachedMinChunkZ = minChunkZ;
-        cachedChunkWidth = chunkWidth;
-        cachedChunkHeight = chunkHeight;
-        cachedRenderData = renderData;
-        return cachedRenderData;
+        return buildRenderData(chunkTowns, padMinChunkX, padMinChunkZ, padWidth, padHeight, EDGE_MARGIN_CHUNKS);
     }
 
     private static VisibleRenderData buildRenderData(TownData[] chunkTowns, int minChunkX, int minChunkZ,
@@ -717,21 +782,6 @@ public final class TownyMinimapOverlay {
                 anchors.computeIfAbsent(town.name(), LabelAnchor::new)
                         .add(blockX + CHUNK_SIZE / 2.0, labelZ);
 
-                // All four sides or none: a partial set draws a box with a missing wall.
-                if (edges.size() + 4 <= MAX_CHUNK_EDGES_PER_FRAME) {
-                    if (!sameTown(town, getTown(chunkTowns, x, z - 1, chunkWidth, chunkHeight))) {
-                        edges.add(new ChunkEdge(blockX, blockZ, blockX + CHUNK_SIZE, blockZ, town));
-                    }
-                    if (!sameTown(town, getTown(chunkTowns, x + 1, z, chunkWidth, chunkHeight))) {
-                        edges.add(new ChunkEdge(blockX + CHUNK_SIZE, blockZ, blockX + CHUNK_SIZE, blockZ + CHUNK_SIZE, town));
-                    }
-                    if (!sameTown(town, getTown(chunkTowns, x, z + 1, chunkWidth, chunkHeight))) {
-                        edges.add(new ChunkEdge(blockX, blockZ + CHUNK_SIZE, blockX + CHUNK_SIZE, blockZ + CHUNK_SIZE, town));
-                    }
-                    if (!sameTown(town, getTown(chunkTowns, x - 1, z, chunkWidth, chunkHeight))) {
-                        edges.add(new ChunkEdge(blockX, blockZ, blockX, blockZ + CHUNK_SIZE, town));
-                    }
-                }
             }
             if (runTown != null) {
                 fillSpans.add(new ChunkFill((minChunkX + runStartX) * CHUNK_SIZE, blockZ,
@@ -739,10 +789,96 @@ public final class TownyMinimapOverlay {
             }
         }
 
+        buildMergedEdges(chunkTowns, minChunkX, minChunkZ, chunkWidth, chunkHeight, margin, edges);
+
         ArrayList<LabelAnchor> labelAnchors = new ArrayList<>(anchors.values());
         labelAnchors.sort(Comparator.comparingInt(LabelAnchor::count).reversed()
                 .thenComparing(LabelAnchor::name, String.CASE_INSENSITIVE_ORDER));
         return new VisibleRenderData(chunkTowns, List.copyOf(fillSpans), List.copyOf(edges), List.copyOf(labelAnchors));
+    }
+
+
+
+    /**
+     * Collects the claim outline as merged runs rather than one quad per chunk side.
+     *
+     * <p>Each side used to be emitted on its own, so a border running fifty chunks straight became
+     * fifty {@code fill} calls -- and Towny claims are rectangular, so long straight runs are the
+     * normal case. The fills beside this were already merged into runs; the outlines never were.
+     *
+     * <p>Two passes, because a run only merges along its own axis: rows for the top and bottom sides,
+     * columns for the left and right. A run continues while consecutive chunks belong to the same town
+     * and still need that same side, which is what keeps a shared border between two towns from being
+     * welded into one line of the wrong colour.
+     *
+     * <p>This runs on the mask worker, so the merging itself costs nothing on frame time -- it only
+     * removes work from the render thread.
+     */
+    private static void buildMergedEdges(TownData[] chunkTowns, int minChunkX, int minChunkZ,
+                                         int chunkWidth, int chunkHeight, int margin,
+                                         ArrayList<ChunkEdge> edges) {
+        // Rows: the top and bottom sides run along x.
+        for (int z = margin; z < chunkHeight - margin; z++) {
+            int blockZ = (minChunkZ + z) * CHUNK_SIZE;
+            TownData topRun = null, botRun = null;
+            int topStart = 0, botStart = 0;
+            for (int x = margin; x <= chunkWidth - margin; x++) {
+                boolean inside = x < chunkWidth - margin;
+                TownData town = inside ? chunkTowns[index(x, z, chunkWidth)] : null;
+                TownData top = inside && town != null
+                        && !sameTown(town, getTown(chunkTowns, x, z - 1, chunkWidth, chunkHeight)) ? town : null;
+                TownData bot = inside && town != null
+                        && !sameTown(town, getTown(chunkTowns, x, z + 1, chunkWidth, chunkHeight)) ? town : null;
+
+                if (top != topRun) {
+                    if (topRun != null && edges.size() < MAX_CHUNK_EDGES_PER_FRAME) {
+                        edges.add(new ChunkEdge((minChunkX + topStart) * CHUNK_SIZE, blockZ,
+                                (minChunkX + x) * CHUNK_SIZE, blockZ, topRun));
+                    }
+                    topRun = top;
+                    topStart = x;
+                }
+                if (bot != botRun) {
+                    if (botRun != null && edges.size() < MAX_CHUNK_EDGES_PER_FRAME) {
+                        edges.add(new ChunkEdge((minChunkX + botStart) * CHUNK_SIZE, blockZ + CHUNK_SIZE,
+                                (minChunkX + x) * CHUNK_SIZE, blockZ + CHUNK_SIZE, botRun));
+                    }
+                    botRun = bot;
+                    botStart = x;
+                }
+            }
+        }
+        // Columns: the left and right sides run along z.
+        for (int x = margin; x < chunkWidth - margin; x++) {
+            int blockX = (minChunkX + x) * CHUNK_SIZE;
+            TownData leftRun = null, rightRun = null;
+            int leftStart = 0, rightStart = 0;
+            for (int z = margin; z <= chunkHeight - margin; z++) {
+                boolean inside = z < chunkHeight - margin;
+                TownData town = inside ? chunkTowns[index(x, z, chunkWidth)] : null;
+                TownData left = inside && town != null
+                        && !sameTown(town, getTown(chunkTowns, x - 1, z, chunkWidth, chunkHeight)) ? town : null;
+                TownData right = inside && town != null
+                        && !sameTown(town, getTown(chunkTowns, x + 1, z, chunkWidth, chunkHeight)) ? town : null;
+
+                if (left != leftRun) {
+                    if (leftRun != null && edges.size() < MAX_CHUNK_EDGES_PER_FRAME) {
+                        edges.add(new ChunkEdge(blockX, (minChunkZ + leftStart) * CHUNK_SIZE,
+                                blockX, (minChunkZ + z) * CHUNK_SIZE, leftRun));
+                    }
+                    leftRun = left;
+                    leftStart = z;
+                }
+                if (right != rightRun) {
+                    if (rightRun != null && edges.size() < MAX_CHUNK_EDGES_PER_FRAME) {
+                        edges.add(new ChunkEdge(blockX + CHUNK_SIZE, (minChunkZ + rightStart) * CHUNK_SIZE,
+                                blockX + CHUNK_SIZE, (minChunkZ + z) * CHUNK_SIZE, rightRun));
+                    }
+                    rightRun = right;
+                    rightStart = z;
+                }
+            }
+        }
     }
 
     /** Minimap town fill alpha. (Boosting it exposed the world-space row banding under rotation, so
@@ -1245,8 +1381,10 @@ public final class TownyMinimapOverlay {
         if (config == null || !config.minimapExtensionsEnabled) return;
         if (session.getProcessor().isCaveModeDisplayed()) return;
         // Which background the user wants the indicator over. Xaero draws its own arrow before our
-        // overlay, so with the EMC layer on it's hidden and ours is the only one; with the layer off
-        // ours lands on top of Xaero's, matching its sprite and scale, so they read as one arrow.
+        // overlay, so with the EMC layer on it's hidden and ours is the only one. With the layer off
+        // Xaero's arrow is visible and ours is laid over it, matching its sprite and scale so the two
+        // read as one -- which is why mode 1 is the default and that second case is opt-in: being an
+        // exact copy is the best it can do, and anything less shows up as two arrows.
         boolean emcLayer = config.squaremapOnMinimap();
         switch (config.minimapIndicatorMode) {
             case 0 -> { return; }
@@ -1575,21 +1713,10 @@ public final class TownyMinimapOverlay {
         if (now - lastMinimapShapeReadAtMs < MINIMAP_SHAPE_CACHE_MS) return cachedMinimapShape;
         lastMinimapShapeReadAtMs = now;
 
-        try {
-            Class<?> hudModClass = Class.forName("xaero.common.HudMod");
-            Object hudMod = hudModClass.getField("INSTANCE").get(null);
-            Object hudConfigs = hudModClass.getMethod("getHudConfigs").invoke(hudMod);
-            Object manager = hudConfigs.getClass().getMethod("getClientConfigManager").invoke(hudConfigs);
-            Class<?> optionsClass = Class.forName("xaero.hud.minimap.common.config.option.MinimapProfiledConfigOptions");
-            Object shapeOption = optionsClass.getField("SHAPE").get(null);
-            Object value = getXaeroProfileOption(manager, shapeOption);
-            if (value instanceof Number number) {
-                cachedMinimapShape = number.intValue();
-                return cachedMinimapShape;
-            }
-        } catch (ReflectiveOperationException | RuntimeException | LinkageError ignored) {
+        if (xaeroOption(false) instanceof Number number) {
+            cachedMinimapShape = number.intValue();
+            return cachedMinimapShape;
         }
-
         cachedMinimapShape = readMinimapShapeFromConfig(cachedMinimapShape);
         return cachedMinimapShape;
     }
@@ -1607,6 +1734,40 @@ public final class TownyMinimapOverlay {
         long now = System.currentTimeMillis();
         if (now - lastArrowOptionReadAtMs < MINIMAP_SHAPE_CACHE_MS) return cachedArrowScale;
         lastArrowOptionReadAtMs = now;
+        // Leave the cached value alone if the read fails; it starts at 1.0.
+        if (xaeroOption(true) instanceof Number n && n.doubleValue() > 0) {
+            cachedArrowScale = n.doubleValue();
+        }
+        return cachedArrowScale;
+    }
+
+    // ── Xaero's config, resolved once ────────────────────────────────────────
+
+    private static Object xaeroConfigManager;
+    private static java.lang.reflect.Method xaeroGetEffective;
+    private static Object xaeroShapeOption;
+    private static Object xaeroArrowScaleOption;
+    /** 0, not Long.MIN_VALUE: the check below is a subtraction, and now - Long.MIN_VALUE
+     *  overflows to a large negative, which reads as "attempted a moment ago" for ever. */
+    private static long xaeroResolveAttemptedAt = 0L;
+
+    /**
+     * Resolves Xaero's config manager and the two options read per frame.
+     *
+     * <p>All of it is fixed for the session, but it used to be looked up on every read: a class load,
+     * four reflective lookups, and -- through {@code getMethods()} -- a fresh copy of the manager
+     * class's entire method array, ten times a second for each of two options. Resolving once leaves
+     * a single {@code invoke} on the per-frame path.
+     *
+     * <p>Retried on a timer rather than latched on first failure: Xaero's {@code HudMod.INSTANCE} is
+     * not populated the instant our class loads, and giving up then would leave the minimap guessing
+     * its shape from the config file for the rest of the session.
+     */
+    private static boolean resolveXaeroConfig() {
+        if (xaeroConfigManager != null) return true;
+        long now = System.currentTimeMillis();
+        if (now - xaeroResolveAttemptedAt < 5_000L) return false;
+        xaeroResolveAttemptedAt = now;
         try {
             Class<?> hudModClass = Class.forName("xaero.common.HudMod");
             Object hudMod = hudModClass.getField("INSTANCE").get(null);
@@ -1614,24 +1775,37 @@ public final class TownyMinimapOverlay {
             Object manager = hudConfigs.getClass().getMethod("getClientConfigManager").invoke(hudConfigs);
             Class<?> optionsClass = Class.forName(
                     "xaero.hud.minimap.common.config.option.MinimapProfiledConfigOptions");
-            Object scaleOption = optionsClass.getField("ARROW_SCALE").get(null);
-            Object value = getXaeroProfileOption(manager, scaleOption);
-            if (value instanceof Number n && n.doubleValue() > 0) {
-                cachedArrowScale = n.doubleValue();
+            java.lang.reflect.Method effective = null;
+            for (var method : manager.getClass().getMethods()) {
+                if ("getEffective".equals(method.getName()) && method.getParameterCount() == 1) {
+                    effective = method;
+                    break;
+                }
             }
+            if (effective == null) return false;
+            xaeroShapeOption = optionsClass.getField("SHAPE").get(null);
+            xaeroArrowScaleOption = optionsClass.getField("ARROW_SCALE").get(null);
+            xaeroGetEffective = effective;
+            xaeroConfigManager = manager;   // set last: nothing is usable until all of it resolved
+            return true;
         } catch (ReflectiveOperationException | RuntimeException | LinkageError ignored) {
-            // Leave the cached value alone; it starts at 1.0.
+            return false;
         }
-        return cachedArrowScale;
     }
 
-    private static Object getXaeroProfileOption(Object manager, Object option)
-            throws ReflectiveOperationException {
-        for (var method : manager.getClass().getMethods()) {
-            if (!"getEffective".equals(method.getName()) || method.getParameterCount() != 1) continue;
-            return method.invoke(manager, option);
+    /**
+     * Reads one of Xaero's two per-frame options. Named rather than passed by reference: the option
+     * objects do not exist until {@link #resolveXaeroConfig()} has run, so a caller reading the field
+     * to pass it in would hand over a null on the very first call.
+     */
+    private static Object xaeroOption(boolean arrowScale) {
+        if (!resolveXaeroConfig()) return null;
+        try {
+            return xaeroGetEffective.invoke(xaeroConfigManager,
+                    arrowScale ? xaeroArrowScaleOption : xaeroShapeOption);
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError ignored) {
+            return null;
         }
-        return null;
     }
 
     private static int readMinimapShapeFromConfig(int fallback) {

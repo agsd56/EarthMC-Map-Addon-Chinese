@@ -6,6 +6,7 @@ import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.network.chat.Style;
 import net.minecraft.network.chat.Component;
+import net.townymap.TownyMapConfig;
 import net.townymap.TownyMapMod;
 import net.townymap.model.EarthMcNationData;
 import net.townymap.model.EarthMcPlayerData;
@@ -38,16 +39,37 @@ public final class TownSearchOverlay {
     private static final int MAX_WIDTH = 460;
     /** Current bar width, recomputed each frame from the query and results so nothing is cut off. */
     private static volatile int panelWidth = WIDTH;
-    /** What an empty bar advertises. The short forms are the ones worth teaching, so they come first. */
+    /**
+     * What an empty bar advertises, top row first -- the stack reads downward now, so this list does
+     * too. The archive row stays at the very top where it has always been drawn, and the filters sit
+     * under it, nearest the history and the bar.
+     */
     private static final List<String> HINTS = List.of(
-            "§7筛选: §fnationless§7, §fn:germany,france",
+            "§7输入 §fdd/mm/yyyy §7= 查看存档",
             "§7筛选: §fr>30,<60§7, §fchunks>500",
-            "§7输入 §fdd/mm/yyyy §7= 查看存档");
+            "§7筛选: §fnationless§7, §fn:germany,france");
+    /**
+     * How many rows of the empty-bar stack are on screen at once: the three hints plus one more.
+     *
+     * <p>That extra row is the whole advertisement for the history -- it holds your newest search, so it
+     * both says "there is history here" and is already clickable, where a row reading "scroll for recents"
+     * would cost the same space and give you nothing to click. The cap is what keeps a long history from
+     * climbing the screen; the rest arrives by scrolling.
+     */
+    private static final int STACK_ROWS = 4;
     private static final int FAVORITES_WIDTH = 74;
     private static final int ROW_HEIGHT = 20;
     private static final int MAX_RESULTS = 7;
     private static final int MAX_PER_TYPE = 3;
+    /** How wide a view a player jump frames, in blocks. They have no outline to fit, but arriving at
+     *  whole-map zoom is no more useful for a player than for a town. */
+    private static final int PLAYER_FRAME_BLOCKS = 512;
     private static final int MAX_INFO_LINES = 11;
+    private static final int SCROLL_TRACK = 0xFF24282D;
+    private static final int SCROLL_THUMB = 0xFF6E757D;
+    private static final int SCROLLBAR_W = 3;
+    /** Gap between the scrollbar and the stack's right border, top and bottom too. */
+    private static final int SCROLLBAR_PAD = 2;
     private static final int BG = 0xD8101010;
     private static final int BORDER = 0xFF333333;
     private static final int ACTIVE_BORDER = 0xFFDDDDDD;
@@ -67,6 +89,12 @@ public final class TownSearchOverlay {
     private static String selectedType = "";
     private static String selectedName = "";
     private static boolean favoritesOpen;
+    /** First visible row of the empty-bar stack, counting up from the bar. 0 = the hints as they were. */
+    private static int stackOffset = 0;
+    /** Absolute index of the highlighted stack row, or -1 for none. Only history rows can hold it. */
+    private static int stackSelected = -1;
+    /** A left-drag that started on the scrollbar is moving the thumb. */
+    private static boolean stackDragging = false;
 
     /** The nation currently selected in the panel (via a capital-star click or a nation search), else null. */
     public static String selectedNationName() {
@@ -103,6 +131,7 @@ public final class TownSearchOverlay {
             clearFilterHighlight();
             focused = true;                          // straight into typing
             selected = 0;
+            resetStack();
         } else if (before == PlanningOverlay.MODE) {
             PlanningOverlay.reset();
             rangeNation = null;
@@ -155,7 +184,8 @@ public final class TownSearchOverlay {
                               List<String> favoriteTowns) {
         Minecraft mc = Minecraft.getInstance();
         Font tr = mc.font;
-        tickTextDrag(mc, sw);   // follow a left-drag over the bar (updates the caret/selection)
+        tickTextDrag(mc, sw);    // follow a left-drag over the bar (updates the caret/selection)
+        tickStackDrag(mc);       // follow a left-drag down the stack's scrollbar
 
         // Results are needed before layout: the bar widens to fit the longest row, so nothing is ellipsised.
         List<Result> results = focused
@@ -232,18 +262,34 @@ public final class TownSearchOverlay {
                 ctx.fill(x, rowY, x + W, rowY + ROW_HEIGHT, i == selected ? HOVER : BG);
                 ctx.text(tr, trimToWidth(tr, result.label(), W - 14), x + 7, rowY + 5, 0xFFFFFFFF, true);
             }
-            // Empty bar: advertise what the bar can do beyond names — filters first, archive last, since
-            // the archive row was the only hint before and stays where players already expect it.
+            // Empty bar: the hints advertise what it can do beyond names, and your recent searches hang
+            // underneath them, nearest the bar. Only STACK_ROWS rows show at once -- the wheel, the arrow
+            // keys and the scrollbar walk the rest, scrolling down into older searches.
             if (query.isEmpty()) {
-                boolean planningPrompt = PlanningOverlay.isActive() && !PlanningOverlay.hasNation();
-                List<String> hints = planningPrompt
-                        ? List.of("§f请输入国家名")
-                        : HINTS;
-                for (int i = 0; i < hints.size(); i++) {
-                    int rowY = resultRowY(y, i);
+                List<StackRow> rows = stackRows();
+                int shown = Math.min(STACK_ROWS, rows.size());
+                stackOffset = clampStackOffset(stackOffset, rows.size());
+                boolean bar = rows.size() > shown;
+                refreshStaleRecents(rows, towns);
+                for (int slot = 0; slot < shown; slot++) {
+                    int index = stackIndexAt(slot, shown);
+                    StackRow row = rows.get(index);
+                    int rowY = resultRowY(y, slot);
                     ctx.fill(x - 1, rowY - 1, x + W + 1, rowY + ROW_HEIGHT + 1, BORDER);
-                    ctx.fill(x, rowY, x + W, rowY + ROW_HEIGHT, BG);
-                    ctx.text(tr, trimToWidth(tr, hints.get(i), W - 14), x + 7, rowY + 5, 0xFFFFFFFF, true);
+                    ctx.fill(x, rowY, x + W, rowY + ROW_HEIGHT, index == stackSelected ? HOVER : BG);
+                    String text = row.label(isStale(row));
+                    int room = W - 14 - (bar ? SCROLLBAR_W + SCROLLBAR_PAD * 2 : 0);
+                    ctx.text(tr, trimToWidth(tr, text, room), x + 7, rowY + 5, 0xFFFFFFFF, true);
+                }
+                if (bar) {
+                    int sx = scrollbarX(x, W);
+                    int trackTop = trackTop(y, shown);
+                    int trackH = trackHeight(shown);
+                    ctx.fill(sx, trackTop, sx + SCROLLBAR_W, trackTop + trackH, SCROLL_TRACK);
+                    int th = thumbHeight(trackH, shown, rows.size());
+                    int thumbY = thumbY(trackTop, trackH, shown, rows.size());
+                    ctx.fill(sx, thumbY, sx + SCROLLBAR_W, thumbY + th,
+                            stackDragging ? ACTIVE_BORDER : SCROLL_THUMB);
                 }
             }
         }
@@ -308,11 +354,39 @@ public final class TownSearchOverlay {
         if (inside(barMx, barMy, x, y, panelWidth, ROW_HEIGHT)) {
             focused = true;
             selected = 0;
+            resetStack();                       // never reopen the stack scrolled somewhere you left it
             caret = charIndexAtX(sw, mouseX);   // place the cursor where they clicked (raw mouse)
             selAnchor = caret;                  // anchor a potential drag-select
             textDragging = true;
             clearSelection();                   // hide the info panel while typing a new search
             return ClickResult.consumedResult();
+        }
+
+        // An empty focused bar shows the hint/history stack in place of results, so it owns these rows.
+        if (focused && query.isEmpty()) {
+            List<StackRow> rows = stackRows();
+            int shown = Math.min(STACK_ROWS, rows.size());
+            stackOffset = clampStackOffset(stackOffset, rows.size());
+            // The scrollbar sits on top of the rows, so it gets first refusal. Its hit area reaches a
+            // few pixels past the bar itself: three pixels of track is not something you can aim at.
+            if (rows.size() > shown) {
+                int sx = scrollbarX(x, panelWidth);
+                int trackTop = trackTop(y, shown);
+                int trackH = trackHeight(shown);
+                if (inside(barMx, barMy, sx - 4, trackTop - SCROLLBAR_PAD,
+                           SCROLLBAR_W + 4 + SCROLLBAR_PAD, trackH + SCROLLBAR_PAD * 2)) {
+                    stackDragging = true;
+                    dragStackTo(barMy, trackTop, trackH, shown, rows.size());
+                    return ClickResult.consumedResult();
+                }
+            }
+            for (int slot = 0; slot < shown; slot++) {
+                if (!inside(barMx, barMy, x, resultRowY(y, slot), panelWidth, ROW_HEIGHT)) continue;
+                StackRow row = rows.get(stackIndexAt(slot, shown));
+                // A hint row is inert, but it still swallows the click: falling through would read as
+                // "clicked outside" and close the bar the player was aiming at.
+                return row.isHistory() ? openRecent(row, towns) : ClickResult.consumedResult();
+            }
         }
 
         if (focused) {
@@ -345,8 +419,7 @@ public final class TownSearchOverlay {
      */
     private static void tickTextDrag(Minecraft mc, int sw) {
         if (!textDragging) return;
-        boolean held = focused && mc.getWindow() != null
-                && GLFW.glfwGetMouseButton(mc.getWindow().handle(), GLFW.GLFW_MOUSE_BUTTON_LEFT) == GLFW.GLFW_PRESS;
+        boolean held = focused && leftMouseHeld(mc);
         if (held) {
             caret = charIndexAtX(sw, mc.mouseHandler.xpos() * sw / (double) mc.getWindow().getWidth());
         } else {
@@ -451,14 +524,22 @@ public final class TownSearchOverlay {
         if (keyCode == GLFW.GLFW_KEY_HOME) { moveCaret(0, shiftDown()); return ClickResult.consumedResult(); }
         if (keyCode == GLFW.GLFW_KEY_END)  { moveCaret(query.length(), shiftDown()); return ClickResult.consumedResult(); }
         if (keyCode == GLFW.GLFW_KEY_DOWN) {
+            if (query.isEmpty()) { moveStackSelection(1); return ClickResult.consumedResult(); }
             if (!results.isEmpty()) selected = Math.min(results.size() - 1, selected + 1);
             return ClickResult.consumedResult();
         }
         if (keyCode == GLFW.GLFW_KEY_UP) {
+            if (query.isEmpty()) { moveStackSelection(-1); return ClickResult.consumedResult(); }
             selected = Math.max(0, selected - 1);
             return ClickResult.consumedResult();
         }
         if (keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER) {
+            if (query.isEmpty() && stackSelected >= 0) {
+                List<StackRow> rows = stackRows();
+                if (stackSelected < rows.size() && rows.get(stackSelected).isHistory()) {
+                    return openRecent(rows.get(stackSelected), towns);
+                }
+            }
             if (!results.isEmpty()) {
                 Result result = results.get(Math.min(selected, results.size() - 1));
                 focused = false;
@@ -481,6 +562,7 @@ public final class TownSearchOverlay {
     /** Post-edit housekeeping: reset the result cursor and rebuild the dropdown. */
     private static void afterEdit() {
         selected = 0;
+        resetStack();
         invalidateResults();
         clearSelection();
     }
@@ -685,7 +767,7 @@ public final class TownSearchOverlay {
             String lowerName = town.name().toLowerCase(Locale.ROOT);
             if (lowerName.contains(needle)) {
                 townMatches.add(new Result("城镇: " + town.name(),
-                        new MapJumpTarget(town.name(), town.centerX(), town.centerZ()),
+                        MapJumpTarget.ofTown(town),
                         score(town.name(), needle), "town", town.name()));
             }
         }
@@ -728,7 +810,7 @@ public final class TownSearchOverlay {
             if (lowerName.contains(needle)
                     && !apiPlayerNames.contains(lowerName)) {
                 playerMatches.add(new Result("玩家: " + player.name() + " (在线)",
-                        new MapJumpTarget(player.name(), player.x(), player.z()),
+                        MapJumpTarget.ofPoint(player.name(), player.x(), player.z(), PLAYER_FRAME_BLOCKS),
                         score(player.name(), needle), "player", player.name()));
             }
         }
@@ -750,7 +832,7 @@ public final class TownSearchOverlay {
             if (markerIndex.containsKey(lowerName)) continue;
             if (playerDetailNames.contains(lowerName)) continue;
             playerMatches.add(new Result("玩家: " + history.name() + " (最后出现)",
-                    new MapJumpTarget(history.name(), history.x(), history.z()),
+                    MapJumpTarget.ofPoint(history.name(), history.x(), history.z(), PLAYER_FRAME_BLOCKS),
                     score(history.name(), needle), "player", history.name()));
         }
         String exact = exactPlayerQuery();
@@ -820,28 +902,40 @@ public final class TownSearchOverlay {
     private static MapJumpTarget playerTarget(String name, PlayerMarker marker,
                                               EarthMcPlayerData details, PlayerHistoryEntry history,
                                               Map<String, TownData> townIndex) {
-        if (marker != null) return new MapJumpTarget(name, marker.x(), marker.z());
-        if (history != null) return new MapJumpTarget(name, history.x(), history.z());
+        // A live position is where they ARE; frame it tightly rather than framing their home town.
+        if (marker != null) return MapJumpTarget.ofPoint(name, marker.x(), marker.z(), PLAYER_FRAME_BLOCKS);
+        if (history != null) return MapJumpTarget.ofPoint(name, history.x(), history.z(), PLAYER_FRAME_BLOCKS);
+        // Offline and unseen: their town is the only place worth going, so frame and flash that instead.
         if (details != null && !details.townName().isBlank()) {
             TownData town = townIndex.get(details.townName().toLowerCase(Locale.ROOT));
             if (town != null) {
-                return new MapJumpTarget(name, town.centerX(), town.centerZ());
+                return MapJumpTarget.ofTown(name, town);
             }
         }
         return null;
     }
 
     private static MapJumpTarget nationTarget(String name, EarthMcNationData details, Map<String, TownData> townIndex) {
-        if (details == null) return null;
-        if (!details.capitalName().isBlank()) {
-            TownData town = townIndex.get(details.capitalName().toLowerCase(Locale.ROOT));
-            if (town != null) {
-                return new MapJumpTarget(name, town.centerX(), town.centerZ());
-            }
-        }
+        TownData capital = details != null && !details.capitalName().isBlank()
+                ? townIndex.get(details.capitalName().toLowerCase(Locale.ROOT))
+                : null;
+        return nationTarget(name, details, capital);
+    }
+
+    /**
+     * Where a nation jump goes: its capital, framed and flashed exactly as if you had searched that town.
+     *
+     * <p>It used to frame the whole nation when it fitted and flash every member claim. On EarthMC that
+     * almost never applies -- Japan is 182 towns across 13,584 blocks, and a nation's extent is usually
+     * set by scattered outposts rather than by anything you would want in view -- so the common case was
+     * a size test that always failed, plus a scan of every town on the map to answer it. The capital is
+     * the one place a nation jump can reliably mean.
+     */
+    private static MapJumpTarget nationTarget(String name, EarthMcNationData details, TownData capital) {
+        if (capital != null) return MapJumpTarget.ofTown(name, capital);
         // Only on Earth: the API spawn is an Earth coordinate, so jumping to it while viewing the Moon
         // would land somewhere unrelated rather than at the nation's outpost.
-        if (details.hasSpawn() && TownyMapMod.viewingEarth()) {
+        if (details != null && details.hasSpawn() && TownyMapMod.viewingEarth()) {
             return new MapJumpTarget(name, details.spawnX(), details.spawnZ());
         }
         return null;
@@ -888,6 +982,10 @@ public final class TownSearchOverlay {
             TownyMapMod.enterArchive(Integer.parseInt(result.name()));
             return;
         }
+        // Everything past the archive branch is somewhere you can go back to, so it joins the history
+        // under the bar. Deliberately here and not in openSearch(), which info-panel links and the
+        // favourites dropdown also route through: those are browsing, not searching.
+        TownyMapMod.rememberSearch(result.type(), result.name());
         if ("town".equals(result.type())) {
             // Towns use the same rich popup as right-clicking the map (Route button + full details),
             // so the search bar and the map share one town GUI instead of a separate inline panel.
@@ -928,6 +1026,7 @@ public final class TownSearchOverlay {
         textDragging = false;
         favoritesOpen = false;
         cachedNeedle = null;
+        resetStack();
         clearSelection();
     }
 
@@ -1203,7 +1302,38 @@ public final class TownSearchOverlay {
             ArrayList<InfoRow> lines = new ArrayList<>();
             lines.add(InfoRow.text("§f§l国家: " + selectedName));
             if (details == null) {
-                lines.add(InfoRow.text("§7详情: §f查询中..."));
+                // While a usable key means the real record is moments away, wait for it: filling the
+                // card from the map first and swapping it a moment later makes the panel change shape
+                // under the reader, which is more distracting than a brief "Checking...".
+                if (TownyMapMod.apiKeyState().usable() && !TownyMapMod.nationLookupFailed(selectedName)) {
+                    lines.add(InfoRow.text("§7详情: §f查询中..."));
+                    return List.copyOf(lines);
+                }
+                // Otherwise this is the answer. Nations are not markers, but their towns are, and
+                // every town's tooltip names its nation -- so the capital, the town count and the
+                // totals across them are all on the map already.
+                net.townymap.api.SquaremapApiClient api = TownyMapMod.getApiClient();
+                net.townymap.api.SquaremapApiClient.MapNationFacts f =
+                        api == null ? null : api.getNationFacts(selectedName);
+                if (f == null || f.townCount() == 0) {
+                    lines.add(InfoRow.text("§7详情: §f查询中..."));
+                    return List.copyOf(lines);
+                }
+                if (!f.capital().isBlank()) lines.add(InfoRow.link("§7首都: §f", f.capital(), "town"));
+                if (!TownyMapMod.isArchiveMode()) {
+                    for (String mega : TownyMapMod.meganationsForNation(selectedName)) {
+                        lines.add(InfoRow.link("§7大联盟: §f", mega, "alliance"));
+                    }
+                    for (String alli : TownyMapMod.alliancesForNation(selectedName)) {
+                        lines.add(InfoRow.link("§7联盟: §f", alli, "alliance"));
+                    }
+                }
+                lines.add(InfoRow.text("§7城镇: §f" + f.townCount()));
+                lines.add(InfoRow.text("§7居民: §f" + f.residentCount()));
+                lines.add(InfoRow.text("§7区块: §f" + f.chunkCount()));
+                lines.add(InfoRow.text(TownyMapMod.apiKeyState().usable()
+                        ? "§8来自地图数据——EarthMC 没有该国家的记录"
+                        : "§8来自地图数据——设置 API 密钥以查看国王、建立时间和加成"));
                 return List.copyOf(lines);
             }
             boolean archive = TownyMapMod.isArchiveMode();
@@ -1211,7 +1341,7 @@ public final class TownSearchOverlay {
             if (!archive) {   // alliance/meganation membership is only known live, not for the archived date
                 // One row per bloc, each a link straight into that bloc's own panel.
                 for (String mega : TownyMapMod.meganationsForNation(selectedName)) {
-                    lines.add(InfoRow.link("§7超级大国: §f", mega, "alliance"));
+                    lines.add(InfoRow.link("§7大联盟: §f", mega, "alliance"));
                 }
                 for (String alli : TownyMapMod.alliancesForNation(selectedName)) {
                     lines.add(InfoRow.link("§7联盟: §f", alli, "alliance"));
@@ -1285,6 +1415,13 @@ public final class TownSearchOverlay {
             lines.add(InfoRow.text("§7地图上: §f" + dateWithAgo(history.lastSeenMs())));
         }
         if (details == null) {
+            // Same reasoning as the nation card: with a usable key and no failure recorded yet, the
+            // record is still coming, so wait rather than drawing a roster card that is about to be
+            // replaced.
+            if (TownyMapMod.apiKeyState().usable() && !TownyMapMod.playerLookupFailed(selectedName)) {
+                lines.add(InfoRow.text("§7详情: §f查询中..."));
+                return List.copyOf(lines);
+            }
             // The EarthMC API has an opt-out, and for those players the lookup never returns -- the card
             // used to sit on "Checking..." forever. Town rosters in markers.json are TOWN data with no
             // opt-out, so fall back to those: it gives the town, and the nation through it. Labelled as
@@ -1294,10 +1431,16 @@ public final class TownSearchOverlay {
             if (api != null) rosterTown = api.townOfResident(selectedName);
             if (rosterTown != null) {
                 lines.add(InfoRow.link("§7城镇: §f", rosterTown, "town"));
-                String rosterNation = api.getTownNation(rosterTown.toLowerCase(Locale.ROOT));
+                String rosterKey = rosterTown.toLowerCase(Locale.ROOT);
+                String rosterNation = api.getTownNation(rosterKey);
                 if (rosterNation != null && !rosterNation.isBlank()) {
-                    lines.add(InfoRow.link("§7国家: §f", rosterNation, "nation"));
+                    // Same shape as the API-backed card above: the capital is said in the label, so the
+                    // value stays the nation's own name and the link still resolves to it.
+                    String label = api.isTownCapital(rosterKey) ? "§7首都: §f" : "§7国家: §f";
+                    lines.add(InfoRow.link(label, rosterNation, "nation"));
                 }
+                // Reached only when the lookup has already failed, or there is no key to make it
+                // with, so this is the card's final state and the note cannot flash up and vanish.
                 lines.add(InfoRow.text("§8来自地图数据（不在 API 中）"));
             } else {
                 // Still say something terminal. An endless "Checking..." reads as broken.
@@ -1337,7 +1480,6 @@ public final class TownSearchOverlay {
 
     private static List<InfoRow> townInfo(TownData town, TownPopupData details,
                                           Map<String, EarthMcNationData> nationDetails) {
-        TownyMapMod.requestTownActive(town.name());   // active count on-demand for the opened town only
         ArrayList<InfoRow> lines = new ArrayList<>();
         lines.add(InfoRow.text("§f§l城镇: " + town.name()));
         if (details == null) {
@@ -1364,10 +1506,15 @@ public final class TownSearchOverlay {
             lines.add(InfoRow.text("§7区块: " + sizeColor + details.numChunks() + maxStr));
         }
         if (!details.founded().isBlank()) lines.add(InfoRow.text("§7建立: §f" + details.founded()));
-        String townInactive = details.activeResidentCount() >= 0
-                && details.activeResidentCount() < details.residentCount()
-                ? " §8(" + (details.residentCount() - details.activeResidentCount()) + " 位不活跃)" : "";
-        lines.add(InfoRow.text("§7居民: §f" + details.residentCount() + townInactive));
+        // Active count first, inactive remainder in the bracket -- the same shape as the town card in
+        // TownInfoOverlay, and the same way EarthMC's own map states it.
+        if (details.activeResidentCount() >= 0 && details.activeResidentCount() <= details.residentCount()) {
+            int townInactive = details.residentCount() - details.activeResidentCount();
+            lines.add(InfoRow.text("§7居民: §f" + details.activeResidentCount()
+                    + (townInactive > 0 ? " §8(不活跃: " + townInactive + ")" : "")));
+        } else {
+            lines.add(InfoRow.text("§7居民: §f" + details.residentCount() + " §8(总计)"));
+        }
         lines.add(InfoRow.text("§7Gold: §f" + formatGold(details.balance())));
         lines.add(InfoRow.text("§7开放: §f" + yesNo(details.isOpen())));
         lines.add(InfoRow.text("§7公开: §f" + yesNo(details.isPublic())));
@@ -1509,16 +1656,10 @@ public final class TownSearchOverlay {
     private static MapJumpTarget favoriteTarget(FavEntry fav, List<TownData> towns) {
         if ("nation".equals(fav.type())) {
             EarthMcNationData nd = TownyMapMod.nationDetails(fav.name());
-            if (nd != null && !nd.capitalName().isBlank()) {
-                TownData capital = townByName(towns, nd.capitalName());
-                if (capital != null) {
-                    return new MapJumpTarget(fav.name(), capital.centerX(), capital.centerZ());
-                }
-            }
-            if (nd != null && nd.hasSpawn() && TownyMapMod.viewingEarth()) {
-                return new MapJumpTarget(fav.name(), nd.spawnX(), nd.spawnZ());
-            }
-            return null;
+            TownData capital = nd != null && !nd.capitalName().isBlank()
+                    ? townByName(towns, nd.capitalName())
+                    : null;
+            return nationTarget(fav.name(), nd, capital);
         }
         if ("player".equals(fav.type())) {
             return TownyMapMod.playerJumpTarget(fav.name());
@@ -1596,9 +1737,11 @@ public final class TownSearchOverlay {
     private static int computePanelWidth(Font tr, List<Result> results, int sw) {
         int needed = tr.width(query) + 20;
         for (Result r : results) needed = Math.max(needed, tr.width(r.label()) + 20);
-        // An empty focused bar shows the hint rows, which are wider than the default bar.
+        // An empty focused bar shows the hint/history stack, whose rows are wider than the default bar
+        // and give up a column to the scrollbar. Every row counts, not just the four on screen, so the
+        // bar keeps one width while you scroll it.
         if (focused && query.isEmpty()) {
-            for (String h : HINTS) needed = Math.max(needed, tr.width(h) + 20);
+            needed = Math.max(needed, stackWidth() + 20 + SCROLLBAR_W + SCROLLBAR_PAD * 2);
         }
         return Math.max(WIDTH, Math.min(Math.min(MAX_WIDTH, Math.max(WIDTH, sw - 24)), needed));
     }
@@ -1618,6 +1761,250 @@ public final class TownSearchOverlay {
     }
 
     private record Result(String label, MapJumpTarget target, int score, String type, String name) {}
+
+    // ── Hint / history stack ─────────────────────────────────────────────────
+
+    /**
+     * One row of the empty-bar stack: first the filter hints, then what you last opened from a search
+     * box. A hint carries only its text and is inert; a history row carries the kind and name its jump
+     * is resolved from, and never a position -- a town's centre moves as it claims and unclaims.
+     */
+    private record StackRow(String hint, String kind, String name, long atMs) {
+
+        boolean isHistory() { return kind != null; }
+
+        String label(boolean stale) {
+            if (hint != null) return hint;
+            // A one-letter tag, the same one the favourites dropdown uses, so the three kinds stay
+            // apart when they share a name.
+            String letter = kind.substring(0, 1).toUpperCase(Locale.ROOT);
+            if (stale) return "§8" + letter + " " + name + "  " + ageLabel(atMs);
+            String tag = switch (kind) {
+                case "nation" -> "§9";
+                case "player" -> "§e";
+                default -> "§7";
+            };
+            return tag + letter + " §f" + name + "  §8" + ageLabel(atMs);
+        }
+    }
+
+    private static List<StackRow> cachedStack = List.of();
+    private static int cachedStackWidth = 0;
+    private static long stackBuiltAt = 0L;
+    private static int stackBuiltKey = Integer.MIN_VALUE;
+
+    /**
+     * The stack, top row first, rebuilt at most once a second.
+     *
+     * <p>It is read several times a frame -- the bar measures it, draws it and hit-tests it -- and a
+     * rebuild is a dozen records, a dozen formatted strings and, through {@link #stackWidth()}, a dozen
+     * font measurements. None of it changes between frames: the only moving part is the "3h ago" on each
+     * row, and a second of staleness cannot show on that. Anything that does change the list on the spot
+     * -- opening a row, clearing the history -- bumps the version and is picked up immediately.
+     */
+    private static List<StackRow> stackRows() {
+        boolean prompt = PlanningOverlay.isActive() && !PlanningOverlay.hasNation();
+        int key = TownyMapMod.searchHistoryVersion() * 2 + (prompt ? 1 : 0);
+        long now = System.currentTimeMillis();
+        if (key == stackBuiltKey && now - stackBuiltAt < 1000L) return cachedStack;
+        stackBuiltKey = key;
+        stackBuiltAt = now;
+
+        List<StackRow> rows = new ArrayList<>();
+        // Mid-prompt the stack is the prompt: history underneath would just be somewhere else to look.
+        if (prompt) {
+            rows.add(new StackRow("§f请输入国家名", null, null, 0L));
+        } else {
+            for (String hint : HINTS) rows.add(new StackRow(hint, null, null, 0L));
+            for (TownyMapConfig.RecentSearch r : TownyMapMod.recentSearches()) {
+                rows.add(new StackRow(null, r.kind(), r.name(), r.atMs()));
+            }
+        }
+        cachedStack = rows;
+        Font tr = Minecraft.getInstance().font;
+        int widest = 0;
+        for (StackRow row : rows) widest = Math.max(widest, tr.width(row.label(false)));
+        cachedStackWidth = widest;
+        return cachedStack;
+    }
+
+    /** Width of the widest row, measured when the stack was built rather than on every frame. */
+    private static int stackWidth() {
+        stackRows();
+        return cachedStackWidth;
+    }
+
+    /** Remembered towns that have dropped off the map, refreshed on a slow tick (never per frame). */
+    private static Set<String> staleRecents = Set.of();
+    private static long staleCheckedAt = 0L;
+
+    /**
+     * Works out which remembered towns no longer exist.
+     *
+     * <p>Every answer is a scan of the whole town list -- getting on for six thousand entries -- so
+     * asking once per visible row per frame was over a million string comparisons a second to grey out
+     * at most four rows. Towns do not come and go between frames.
+     *
+     * <p>Only towns are dimmed. Nations and players resolve lazily, so a missing one usually means the
+     * detail has not arrived yet rather than that it is gone.
+     */
+    private static void refreshStaleRecents(List<StackRow> rows, List<TownData> towns) {
+        long now = System.currentTimeMillis();
+        if (now - staleCheckedAt < 2000L) return;
+        staleCheckedAt = now;
+        if (towns.isEmpty()) { staleRecents = Set.of(); return; }   // still loading: nothing is "gone" yet
+        Set<String> stale = new HashSet<>();
+        for (StackRow row : rows) {
+            if ("town".equals(row.kind()) && townByName(towns, row.name()) == null) stale.add(row.name());
+        }
+        staleRecents = stale;
+    }
+
+    private static boolean isStale(StackRow row) {
+        return "town".equals(row.kind()) && staleRecents.contains(row.name());
+    }
+
+    private static int clampStackOffset(int offset, int total) {
+        return Math.max(0, Math.min(Math.max(0, total - STACK_ROWS), offset));
+    }
+
+    // The stack reads downward -- hints, then history -- while the rows are drawn upward from the bar,
+    // so slot 0 sits nearest the bar and holds the LAST visible entry. Everything below converts
+    // between the two; nothing else in the file needs to know which way round they are.
+
+    /** The content index drawn in {@code slot}, counting slots up from the search bar. */
+    private static int stackIndexAt(int slot, int shown) {
+        return stackOffset + (shown - 1 - slot);
+    }
+
+    /** Top edge of the whole stack. The rows are contiguous, so it is one block {@code shown} tall. */
+    private static int stackTop(int searchY, int shown) {
+        return resultRowY(searchY, shown - 1);
+    }
+
+    private static int scrollbarX(int x, int w) {
+        return x + w - SCROLLBAR_PAD - SCROLLBAR_W;
+    }
+
+    private static int trackTop(int searchY, int shown) {
+        return stackTop(searchY, shown) + SCROLLBAR_PAD;
+    }
+
+    private static int trackHeight(int shown) {
+        return shown * ROW_HEIGHT - SCROLLBAR_PAD * 2;
+    }
+
+    /** Thumb length as its share of the list, with a floor so a long history still leaves it grabbable. */
+    private static int thumbHeight(int trackH, int shown, int total) {
+        return Math.max(12, Math.min(trackH, trackH * shown / Math.max(1, total)));
+    }
+
+    private static int thumbY(int trackTop, int trackH, int shown, int total) {
+        int max = total - shown;
+        if (max <= 0) return trackTop;
+        return trackTop + (trackH - thumbHeight(trackH, shown, total)) * stackOffset / max;
+    }
+
+    /** Puts the thumb's centre under the cursor, clamped to the track. */
+    private static void dragStackTo(double my, int trackTop, int trackH, int shown, int total) {
+        int max = total - shown;
+        if (max <= 0) { stackOffset = 0; return; }
+        double span = trackH - thumbHeight(trackH, shown, total);
+        double frac = span <= 0 ? 0 : (my - trackTop - thumbHeight(trackH, shown, total) / 2.0) / span;
+        stackOffset = clampStackOffset((int) Math.round(Math.max(0, Math.min(1, frac)) * max), total);
+    }
+
+    /**
+     * Follows a left-drag down the scrollbar.
+     *
+     * <p>Polled rather than handled: the press arrives through Xaero's screen but the release never
+     * does, so without this the thumb would stay stuck to the cursor after the button came up. The
+     * text selection below drags the same way, for the same reason.
+     */
+    private static void tickStackDrag(Minecraft mc) {
+        if (!stackDragging) return;
+        List<StackRow> rows = stackRows();
+        int shown = Math.min(STACK_ROWS, rows.size());
+        if (!focused || !query.isEmpty() || rows.size() <= shown || !leftMouseHeld(mc)) {
+            stackDragging = false;
+            return;
+        }
+        int y = top();
+        double my = mc.mouseHandler.ypos() * mc.getWindow().getGuiScaledHeight()
+                / (double) mc.getWindow().getScreenHeight();
+        if (UiScale.active()) my = UiScale.unscale(my, y + ROW_HEIGHT / 2.0);
+        dragStackTo(my, trackTop(y, shown), trackHeight(shown), shown, rows.size());
+    }
+
+    private static boolean leftMouseHeld(Minecraft mc) {
+        return mc.getWindow() != null
+                && GLFW.glfwGetMouseButton(mc.getWindow().handle(), GLFW.GLFW_MOUSE_BUTTON_LEFT)
+                        == GLFW.GLFW_PRESS;
+    }
+
+    private static void resetStack() {
+        stackOffset = 0;
+        stackSelected = -1;
+        stackDragging = false;
+    }
+
+    /**
+     * Wheel over the stack. True only when the cursor is actually on it, so everywhere else the wheel
+     * still zooms Xaero's map -- swallowing it over the middle of the screen would be unusable.
+     */
+    public static boolean mouseScrolled(double mouseX, double mouseY, double amount, int sw) {
+        if (!focused || !query.isEmpty() || amount == 0) return false;
+        List<StackRow> rows = stackRows();
+        int shown = Math.min(STACK_ROWS, rows.size());
+        if (rows.size() <= shown) return false;          // nothing to scroll: leave the zoom alone
+        int x = left(sw);
+        int y = top();
+        double mx = mouseX, my = mouseY;
+        if (UiScale.active()) {
+            mx = UiScale.unscale(mouseX, x + panelWidth / 2.0);
+            my = UiScale.unscale(mouseY, y + ROW_HEIGHT / 2.0);
+        }
+        if (!inside(mx, my, x, stackTop(y, shown), panelWidth, shown * ROW_HEIGHT)) return false;
+        stackOffset = clampStackOffset(stackOffset + (amount > 0 ? -1 : 1), rows.size());
+        return true;
+    }
+
+    /**
+     * Arrows over the stack, which only the history rows accept. The stack reads downward -- hints on
+     * top, newest search under them, older ones below that -- so DOWN goes further back through the
+     * history and UP climbs out through the hints and off the list, the same way the results read.
+     */
+    private static void moveStackSelection(int screenDelta) {
+        List<StackRow> rows = stackRows();
+        // The history can shrink under a selection -- cleared from the settings, or the planning prompt
+        // taking the stack over -- which would otherwise leave the index stranded past the last row,
+        // where neither direction can reach it again.
+        if (stackSelected >= rows.size()) stackSelected = -1;
+        if (stackSelected < 0 && screenDelta < 0) return;   // nothing selected: only DOWN enters the stack
+        int i = stackSelected < 0 ? -1 : stackSelected;
+        do {
+            i += screenDelta;
+            if (i < 0) { resetStack(); return; }             // climbed out past the top hint
+            if (i >= rows.size()) return;                    // already on the oldest: stay put
+        } while (!rows.get(i).isHistory());
+        stackSelected = i;
+        if (stackSelected < stackOffset) stackOffset = stackSelected;
+        else if (stackSelected >= stackOffset + STACK_ROWS) stackOffset = stackSelected - STACK_ROWS + 1;
+        stackOffset = clampStackOffset(stackOffset, rows.size());
+    }
+
+    /** Re-opens a remembered search: its panel or popup, plus a jump to wherever it is now. */
+    private static ClickResult openRecent(StackRow row, List<TownData> towns) {
+        resetStack();
+        TownData town = "town".equals(row.kind()) ? townByName(towns, row.name()) : null;
+        // Re-using a row is a search too, so it moves back to the top; otherwise the row you open most
+        // would drift down the list while rows you opened once sat above it.
+        TownyMapMod.rememberSearch(row.kind(), row.name());
+        openSearch(row.kind(), row.name());   // fills the bar, drops focus, raises the popup or panel
+        if (town != null) return ClickResult.jump(town);
+        MapJumpTarget target = favoriteTarget(new FavEntry(row.kind(), row.name(), null), towns);
+        return target != null ? ClickResult.jump(target) : ClickResult.consumedResult();
+    }
 
     // ── Property filters ─────────────────────────────────────────────────────
 
@@ -1785,7 +2172,7 @@ public final class TownSearchOverlay {
             String label = "城镇: " + town.name() + (detail.isEmpty() ? "" : "  (" + detail + ")");
             matched.add(key);
             hits.add(new Hit(new Result(label,
-                    new MapJumpTarget(town.name(), town.centerX(), town.centerZ()),
+                    MapJumpTarget.ofTown(town),
                     0, "town", town.name()),
                     !f.chunks().isEmpty() ? chunks : Math.max(residents, 0)));
         }
@@ -1834,7 +2221,7 @@ public final class TownSearchOverlay {
         }
 
         public static ClickResult jump(TownData town) {
-            return new ClickResult(true, new MapJumpTarget(town.name(), town.centerX(), town.centerZ()));
+            return new ClickResult(true, MapJumpTarget.ofTown(town));
         }
 
         public static ClickResult jump(MapJumpTarget target) {

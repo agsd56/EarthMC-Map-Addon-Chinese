@@ -18,17 +18,41 @@ public record TownPopupData(
         int     residentCount,
         double  balance,
         int     activeResidentCount, // residents active within 42 days; -1 if not looked up
-        int     maxChunks            // EarthMC's own claim max (stats.maxTownBlocks); -1 if absent
+        int     maxChunks,           // EarthMC's own claim max (stats.maxTownBlocks); -1 if absent
+        /**
+         * Built from the live map alone, with no API answer behind it.
+         *
+         * <p>Four of the fields above exist only in EarthMC's API -- balance, isOpen, isForSale and
+         * maxChunks -- and a record's defaults cannot say "unknown": a false reads as "no" and a 0
+         * balance reads as broke. This flag is what lets the card leave those rows out instead of
+         * stating something it does not know.
+         */
+        boolean mapOnly,
+        /**
+         * Whether {@link #balance()} is a figure we actually have, as opposed to the record's zero.
+         *
+         * <p>{@code mapOnly} used to imply "no balance", because the only keyless card was built from
+         * the squaremap markers and those carry no gold. /map/v1 does carry it, so the two questions
+         * came apart: a card can now be map-built and still know the bank. Without this the keyless
+         * card either hid gold it had or printed a confident "0" for every town on the server.
+         */
+        boolean balanceKnown
 ) {
     public static final TownPopupData WILDERNESS =
             new TownPopupData("Wilderness", "", "", "", "", 0, "", false, false, false, false,
-                    false, false, false, 0, 0, -1, -1);
+                    false, false, false, 0, 0, -1, -1, false, false);
 
-    /** Returns a copy with the active-resident count filled in (looked up on demand, off the
-     *  base town fetch so the map's bulk fetches stay cheap). */
-    public TownPopupData withActiveResidentCount(int count) {
+    /**
+     * A copy carrying the town's TOTAL resident count.
+     *
+     * <p>The keyed API gives only the active one -- it filters both {@code stats.numResidents} and
+     * the roster to the last 42 days -- so the total comes from /map/v1. Everything else is left
+     * alone.
+     */
+    public TownPopupData withTotalResidentCount(int total) {
         return new TownPopupData(townName, nationName, discord, board, mayor, numChunks, founded, pvp,
-                isPublic, canOutsidersSpawn, isOverClaimed, isOpen, isForSale, hasNation, residentCount,
-                balance, count, maxChunks);
+                isPublic, canOutsidersSpawn, isOverClaimed, isOpen, isForSale, hasNation, total,
+                balance, activeResidentCount, maxChunks, mapOnly, balanceKnown);
     }
+
 }

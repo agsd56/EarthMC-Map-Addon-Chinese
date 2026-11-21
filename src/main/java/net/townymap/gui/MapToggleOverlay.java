@@ -25,6 +25,10 @@ public final class MapToggleOverlay {
     private static final int FILL_WIDTH = 34;
     private static final int SETTINGS_GAP = 7;   // extra gap above the settings button
     private static final int TOGGLE_ROWS = 6;    // Squaremap | Borders | Map mode | World | Chunks | Counter
+    /** Counter is the last of those rows, and Reset sits beside it. Derived rather than written out
+     *  again, because writing it out again is how Reset ended up next to Chunks: it was pinned to
+     *  row 4 and stayed there when the World row was inserted above. */
+    private static final int COUNTER_ROW = TOGGLE_ROWS - 1;
 
     private MapToggleOverlay() {}
 
@@ -44,7 +48,8 @@ public final class MapToggleOverlay {
         drawMode(ctx, tr, 3, y, "世界", worldModeLabel(config),
                 !TownyMapMod.viewingEarth() || config.mapWorldMode != TownyMapMod.WORLD_MODE_AUTO);
         drawToggle(ctx, tr, 4, y, "区块", config.chunkGridEnabled);
-        drawMode(ctx, tr, 5, y, "区块计数", ChunkCounterOverlay.toolbarLabel(config), config.chunkCounterEnabled);
+        drawMode(ctx, tr, COUNTER_ROW, y, "区块计数", ChunkCounterOverlay.toolbarLabel(config),
+                config.chunkCounterEnabled);
         if (config.chunkCounterEnabled) {
             if (ChunkCounterOverlay.isMultiMode(config)) {
                 drawCounterGroupButtons(ctx, tr, config);
@@ -171,7 +176,7 @@ public final class MapToggleOverlay {
 
     private static void drawCounterResetButton(GuiGraphicsExtractor ctx, Font tr, int baseY) {
         int x = LEFT + WIDTH + RESET_GAP;
-        int y = baseY + 4 * (HEIGHT + GAP);
+        int y = baseY + COUNTER_ROW * (HEIGHT + GAP);
         drawTexturedButton(ctx, x, y, RESET_WIDTH, HEIGHT, "重置", true, 0xFFFF5555);
     }
 
@@ -216,7 +221,7 @@ public final class MapToggleOverlay {
 
     private static boolean insideCounterReset(double mouseX, double mouseY, int sh) {
         int x = LEFT + WIDTH + RESET_GAP;
-        int y = togglesTop(sh) + 4 * (HEIGHT + GAP);
+        int y = togglesTop(sh) + COUNTER_ROW * (HEIGHT + GAP);
         return mouseX >= x && mouseX <= x + RESET_WIDTH
                 && mouseY >= y && mouseY <= y + HEIGHT;
     }
@@ -290,9 +295,13 @@ public final class MapToggleOverlay {
             case 1 -> "外来者传送";
             case 2 -> "超占";
             case 3 -> "开放";
-            case 4 -> "超级大国";
+            case 4 -> "大联盟";
             case 5 -> "联盟";
             case 6 -> "规划";
+            // The network is fetched the moment this mode is picked, so say so rather than showing an
+            // empty map for the second it takes.
+            case 7 -> net.townymap.integration.CustomOverlayManager.hasIceHighways()
+                    ? "公路网" : "公路网...";
             default -> "无";
         };
     }

@@ -37,6 +37,134 @@ public class EarthMcApiClient {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("TownyMapAddon");
     private static final String BASE = "https://api.earthmc.net/v4";
+    /** The keyless half of EarthMC's API. Same host, no key, limited to what the web map shows. */
+    private static final String MAP_BASE = "https://api.earthmc.net/map/v1";
+
+    // ── API key ──────────────────────────────────────────────────────────────────────────────
+    // EarthMC requires a key in the Authorization header on EVERY endpoint from 2026-11-19, and stops
+    // reading the "key" field out of POST bodies at the same time. So the header is the only form sent
+    // here, and a missing or refused key is treated the way the server is about to treat it: the
+    // request is not made at all. Letting it run anonymously until the deadline would mean every user
+    // discovering the change simultaneously, on a day nobody is watching.
+    //
+    // The key goes to api.earthmc.net and nowhere else. This mod also talks to map.earthmc.net, GitHub,
+    // the Wayback Machine, mc-heads and the alliance source, and isEarthMcApi is what keeps it off all
+    // of them. The value is never logged, at any level.
+    private static final String API_HOST = "api.earthmc.net";
+    /** How long a refused key is held before one request is spent re-testing it. */
+    private static final long REJECTED_RECHECK_MS = 120_000L;
+    private volatile String apiKey = "";
+    private volatile ApiKeyState keyState = ApiKeyState.MISSING;
+    private volatile long rejectedCheckedAt = 0L;
+    private final java.util.concurrent.atomic.AtomicBoolean missingKeyLogged =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private final java.util.concurrent.atomic.AtomicBoolean rejectedKeyLogged =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** Applies the configured key. The value itself is never logged, here or anywhere else. */
+    public void setApiKey(String key) {
+        String k = key == null ? "" : key.trim();
+        if (k.equals(apiKey)) return;
+        apiKey = k;
+        keyState = k.isEmpty() ? ApiKeyState.MISSING : ApiKeyState.UNVERIFIED;
+        rejectedCheckedAt = 0L;
+        missingKeyLogged.set(false);
+        rejectedKeyLogged.set(false);
+    }
+
+    public ApiKeyState keyState() { return keyState; }
+
+    public boolean hasApiKey() { return !apiKey.isEmpty(); }
+
+    /** How many characters the stored key has -- never the key itself. A refusal caused by a key that
+     *  arrived cut short is otherwise indistinguishable from a wrong one, and this is what separates
+     *  them at a glance. */
+    public int apiKeyLength() { return apiKey.length(); }
+
+    /** EarthMC's own API, and nothing else -- the one thing standing between the key and every other
+     *  host this mod contacts. Anything unparseable is treated as "not EarthMC", so a malformed URL
+     *  fails closed and carries no key. */
+    private static boolean isEarthMcApi(String url) {
+        try {
+            return API_HOST.equalsIgnoreCase(URI.create(url).getHost());
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Whether EarthMC requires a key for this endpoint.
+     *
+     * <p>Since 2026-11-19 every /v4 endpoint refuses an unkeyed request, and /map/v1 is the
+     * documented exception. It lives on the same host, so the host check alone would gate it shut
+     * for precisely the users it was added to serve -- and would attach a key they do not have.
+     * Anything unparseable counts as keyed, so it is held back rather than sent bare.
+     */
+    private static boolean needsApiKey(String url) {
+        if (!isEarthMcApi(url)) return false;
+        try {
+            String path = URI.create(url).getPath();
+            return path == null || !path.startsWith("/map/");
+        } catch (RuntimeException e) {
+            return true;
+        }
+    }
+
+    /** Whether a request may be sent at all. False means no socket is opened. */
+    private boolean apiAllowed(String url) {
+        if (!needsApiKey(url)) return true;
+        if (apiKey.isEmpty()) {
+            keyState = ApiKeyState.MISSING;
+            if (missingKeyLogged.compareAndSet(false, true)) {
+                LOGGER.warn("[TownyMap] No EarthMC API key set, so API lookups are off. Run /api key"
+                        + " copy in game -- or /api key create if you have never made one -- then put"
+                        + " the key in Settings -> EarthMC API Key. The map itself -- borders, town"
+                        + " names, players -- needs no key and is unaffected.");
+            }
+            return false;
+        }
+        if (keyState == ApiKeyState.REJECTED) {
+            // Re-test now and then so a corrected key recovers without a restart. Stamp the ATTEMPT,
+            // never the success: a guard that arms only when the call works runs at frame rate when it
+            // doesn't, which has bitten this codebase twice already.
+            long now = System.currentTimeMillis();
+            if (now - rejectedCheckedAt < REJECTED_RECHECK_MS) return false;
+            rejectedCheckedAt = now;
+        }
+        return true;
+    }
+
+    private void noteKeyRefused(int status) {
+        keyState = ApiKeyState.REJECTED;
+        rejectedCheckedAt = System.currentTimeMillis();
+        if (rejectedKeyLogged.compareAndSet(false, true)) {
+            LOGGER.warn("[TownyMap] EarthMC refused the API key (HTTP {}). Check it in Settings ->"
+                    + " EarthMC API Key, or run /api key copy in game to pick up the current one.", status);
+        }
+    }
+
+    /**
+     * Tests the key against EarthMC's own /authtest endpoint, which exists for exactly this.
+     * Forces the attempt even while a refusal is being held, since the user asked for it.
+     */
+    public CompletableFuture<ApiKeyState> verifyKey() {
+        return CompletableFuture.supplyAsync(() -> {
+            if (apiKey.isEmpty()) {
+                keyState = ApiKeyState.MISSING;
+                return keyState;
+            }
+            rejectedCheckedAt = 0L;
+            rejectedKeyLogged.set(false);
+            // /authtest is the ONLY endpoint that judges the key. Measured 2026-11-13: a bogus key
+            // gets 401 here, and 200 from POST /v4/towns, GET /v4/towns and the rest -- they ignore
+            // the header until 2026-11-19. So a successful data request must never be read as proof
+            // the key is good, or a typo would look fine right up until the morning it stops working.
+            boolean ok = get(BASE + "/authtest") != null;
+            if (ok) keyState = ApiKeyState.OK;   // a 401 has already set REJECTED via noteKeyRefused
+            return keyState;
+        }, executor);
+    }
+
     private static final DateTimeFormatter DATE_FMT =
             DateTimeFormatter.ofPattern("yyyy-MM-dd");
 
@@ -118,6 +246,72 @@ public class EarthMcApiClient {
         }, executor);
     }
 
+    /**
+     * The keyless town record: {@code GET /map/v1/town/{name}}.
+     *
+     * <p>Worth calling even with a key, because it costs nothing against the key's budget and carries
+     * the total resident roll and the authoritative claim count, neither of which /v4 gives. Returns
+     * null for an unknown town (EarthMC answers a plain 404) or any failure.
+     */
+    public CompletableFuture<net.townymap.model.MapTownData> fetchMapTown(String townName) {
+        if (townName == null || townName.isBlank()) return CompletableFuture.completedFuture(null);
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                String encoded = java.net.URLEncoder.encode(townName, java.nio.charset.StandardCharsets.UTF_8)
+                        .replace("+", "%20");
+                String body = get(MAP_BASE + "/town/" + encoded);
+                if (body == null) return null;
+                JsonElement root = JsonParser.parseString(body);
+                if (!root.isJsonObject()) return null;
+                return parseMapTown(root.getAsJsonObject());
+            } catch (Exception e) {
+                LOGGER.warn("[TownyMap] /map/v1 town lookup failed for {}: {}", townName, e.getMessage());
+                return null;
+            }
+        }, executor);
+    }
+
+    private net.townymap.model.MapTownData parseMapTown(JsonObject o) {
+        String name = str(o, "name", "");
+        if (name.isEmpty()) return null;
+        String mayor = str(o, "mayor", "");
+        String nation = "";
+        if (o.has("nation") && o.get("nation").isJsonObject()) {
+            nation = str(o.getAsJsonObject("nation"), "name", "");
+        }
+        String board = "";
+        String discord = "";
+        if (o.has("links") && o.get("links").isJsonObject()) {
+            JsonObject links = o.getAsJsonObject("links");
+            board = str(links, "board", "");
+            discord = str(links, "discord", "");
+        }
+        int residents = o.has("residents") && o.get("residents").isJsonArray()
+                ? o.getAsJsonArray("residents").size() : 0;
+        int claims = 0;
+        double balance = 0.0;
+        String founded = "";
+        if (o.has("stats") && o.get("stats").isJsonObject()) {
+            JsonObject stats = o.getAsJsonObject("stats");
+            claims = intOf(stats, "claims", 0);
+            balance = dblOf(stats, "balance", 0.0);
+            long ms = ts(stats, "founded");
+            if (ms > 0) {
+                founded = Instant.ofEpochMilli(ms).atZone(ZoneId.systemDefault())
+                        .toLocalDate().format(DATE_FMT);
+            }
+        }
+        boolean pvp = false;
+        boolean isPublic = false;
+        if (o.has("status") && o.get("status").isJsonObject()) {
+            JsonObject status = o.getAsJsonObject("status");
+            pvp = bool(status, "pvp");
+            isPublic = bool(status, "public");
+        }
+        return new net.townymap.model.MapTownData(name, mayor, nation, board, discord,
+                residents, claims, balance, founded, pvp, isPublic);
+    }
+
     /** /towns accepts up to 100 names per query. */
     private static final int TOWN_QUERY_BATCH = 100;
 
@@ -183,6 +377,7 @@ public class EarthMcApiClient {
         JsonArray q = new JsonArray();
         batch.forEach(q::add);
         body.add("query", q);
+        template(body, "name", "outlaws", "trusted");
 
         String json = null;
         for (int attempt = 0; attempt < 3 && json == null; attempt++) {
@@ -206,6 +401,24 @@ public class EarthMcApiClient {
     }
 
     /** Adds one town's roster to the tally. Entries may be plain strings or {name, uuid} objects. */
+    /**
+     * Restricts the response to the fields the caller actually parses.
+     *
+     * <p>The API returns the whole entity otherwise, and most of it is thrown away: for towns that is
+     * the full claim list, every resident, trusted and outlaw name, the ranks, warps and bank history.
+     * A hundred towns is 82 KB gzipped whole against 2 KB for the three fields the rankings read.
+     *
+     * <p>Two things to know. A field name the API does not recognise is ignored rather than rejected,
+     * so a rename degrades to a missing value instead of a failed request. And the value must be
+     * {@code true}: passing a nested object to narrow a field drops that field from the response
+     * entirely, with no error.
+     */
+    private static void template(JsonObject body, String... fields) {
+        JsonObject tpl = new JsonObject();
+        for (String f : fields) tpl.addProperty(f, true);
+        body.add("template", tpl);
+    }
+
     private static void tally(JsonObject town, String field, int slot, java.util.Map<String, int[]> out) {
         JsonElement el = town.get(field);
         if (el == null || !el.isJsonArray()) return;
@@ -255,6 +468,7 @@ public class EarthMcApiClient {
         JsonArray q = new JsonArray();
         batch.forEach(q::add);
         body.add("query", q);
+        template(body, "name", "stats", "timestamps");
         String json = null;
         for (int attempt = 0; attempt < 5 && json == null; attempt++) {
             if (attempt > 0) {
@@ -277,8 +491,15 @@ public class EarthMcApiClient {
                 JsonObject st = t.getAsJsonObject("stats");
                 if (st.has("balance") && st.get("balance").isJsonPrimitive()) bal = st.get("balance").getAsDouble();
             }
+            // stats.numOutlaws is the same number as the array length (checked across a full batch) and
+            // comes free with stats, where the array itself is ~5 KB per hundred towns.
             int outlaws = 0;
-            if (t.has("outlaws") && t.get("outlaws").isJsonArray()) outlaws = t.getAsJsonArray("outlaws").size();
+            if (t.has("stats") && t.get("stats").isJsonObject()) {
+                JsonObject st2 = t.getAsJsonObject("stats");
+                if (st2.has("numOutlaws") && st2.get("numOutlaws").isJsonPrimitive()) {
+                    outlaws = st2.get("numOutlaws").getAsInt();
+                }
+            }
             long founded = 0;
             if (t.has("timestamps") && t.get("timestamps").isJsonObject()) {
                 founded = ts(t.getAsJsonObject("timestamps"), "registered");
@@ -293,6 +514,7 @@ public class EarthMcApiClient {
         JsonArray q = new JsonArray();
         batch.forEach(q::add);
         body.add("query", q);
+        template(body, "name", "board", "discord", "mayor", "nation", "stats", "status", "timestamps");
 
         String json = null;
         for (int attempt = 0; attempt < 3 && json == null; attempt++) {
@@ -373,6 +595,7 @@ public class EarthMcApiClient {
                 JsonArray query = new JsonArray();
                 query.add(playerName);
                 body.add("query", query);
+                template(body, "name", "uuid", "formattedName", "town", "nation", "stats", "status", "timestamps");
 
                 String json = post(BASE + "/players", body.toString());
                 if (json == null) return null;
@@ -421,6 +644,7 @@ public class EarthMcApiClient {
         JsonArray q = new JsonArray();
         batch.forEach(q::add);
         body.add("query", q);
+        template(body, "name", "uuid", "formattedName", "town", "nation", "stats", "status", "timestamps");
 
         // A whole-roster sweep is ~600 batches, so a batch that gives up loses 100 players silently.
         // 120ms/240ms was never going to outlast a rate limiter: five attempts with exponential backoff
@@ -464,6 +688,7 @@ public class EarthMcApiClient {
                 JsonArray query = new JsonArray();
                 query.add(nationName);
                 body.add("query", query);
+                template(body, "name", "uuid", "board", "discord", "king", "capital", "coordinates", "stats", "status", "timestamps");
 
                 String json = post(BASE + "/nations", body.toString());
                 if (json == null) return null;
@@ -507,6 +732,7 @@ public class EarthMcApiClient {
         JsonArray q = new JsonArray();
         batch.forEach(q::add);
         body.add("query", q);
+        template(body, "name", "uuid", "board", "discord", "king", "capital", "coordinates", "stats", "status", "timestamps");
 
         String json = null;
         for (int attempt = 0; attempt < 3 && json == null; attempt++) {
@@ -615,14 +841,18 @@ public class EarthMcApiClient {
             if (status.has("hasNation")) hasNation = status.get("hasNation").getAsBoolean();
         }
 
-        // NOTE: the active-resident lookup is intentionally NOT done here. parseTown runs for every
-        // visible town when a status overlay is active (requestVisibleTownDetails), so a per-resident
-        // bulk POST here would fire hundreds of extra calls, get rate-limited, and corrupt both the
-        // inactive count AND this town's own data. It's looked up on demand for the focused town only
-        // (fetchTownActiveResidents). -1 = "not looked up".
+        // stats.numResidents counts only residents active in the last 42 days, and the residents list
+        // is filtered the same way: EarthMC applied that rule to the API after this mod first shipped,
+        // so the field that used to mean "everyone" now means "active". The active count therefore
+        // arrives free with the base fetch, and the per-resident /players sweep that used to compute
+        // it -- up to twenty extra POSTs for one town -- is gone.
+        //
+        // The TOTAL is what the API no longer gives. It comes off the squaremap popup, which still
+        // lists every member, and cacheTownDetails overlays it. Until it does, both read the same,
+        // which shows no inactive count rather than a wrong one.
         return new TownPopupData(name, nation, discord, board, mayor, chunks, founded, pvp,
                 isPublic, canOutsidersSpawn, isOverClaimed, isOpen, isForSale, hasNation, residents, balance,
-                -1, maxChunks);
+                residents, maxChunks, false, true);
     }
 
     /** On-demand for ONE focused nation: BOTH the active-resident count and the bonus-drop projection from
@@ -636,6 +866,7 @@ public class EarthMcApiClient {
                 JsonArray q = new JsonArray();
                 q.add(nationName);
                 body.add("query", q);
+                template(body, "name", "stats", "residents");
                 String json = postGated(BASE + "/nations", body.toString());
                 if (json == null) return NationResidentStats.NONE;
                 JsonArray arr = JsonParser.parseString(json).getAsJsonArray();
@@ -695,6 +926,7 @@ public class EarthMcApiClient {
                 JsonArray q = new JsonArray();
                 q.add(townName);
                 body.add("query", q);
+                template(body, "name", "coordinates");
                 String json = postGated(BASE + "/towns", body.toString());
                 if (json == null) return null;
                 JsonArray arr = JsonParser.parseString(json).getAsJsonArray();
@@ -717,28 +949,6 @@ public class EarthMcApiClient {
         }, executor);
     }
 
-    /** On-demand active-resident count for ONE focused town: one /towns fetch + one resident-timestamp pass
-     *  (shared/cached with the nation lookups). Gated to avoid the 429 storms that would hide the Inactive row.
-     *  Returns -1 if it can't be determined (caller falls back to the raw resident count). */
-    public CompletableFuture<Integer> fetchTownActiveResidents(String townName) {
-        return CompletableFuture.supplyAsync(() -> {
-            if (townName == null || townName.isBlank()) return -1;
-            try {
-                JsonObject body = new JsonObject();
-                JsonArray q = new JsonArray();
-                q.add(townName);
-                body.add("query", q);
-                String json = postGated(BASE + "/towns", body.toString());
-                if (json == null) return -1;
-                JsonArray arr = JsonParser.parseString(json).getAsJsonArray();
-                if (arr.isEmpty()) return -1;
-                return computeTownActive(arr.get(0).getAsJsonObject());
-            } catch (RuntimeException e) {
-                return -1;
-            }
-        }, executor);
-    }
-
     /**
      * When this town becomes overclaimable, from its residents' purge dates.
      *
@@ -754,6 +964,7 @@ public class EarthMcApiClient {
                 JsonArray q = new JsonArray();
                 q.add(townName);
                 body.add("query", q);
+                template(body, "name", "stats", "residents");
                 String json = postGated(BASE + "/towns", body.toString());
                 if (json == null) return TownOverclaimProjection.NONE;
                 JsonArray arr = JsonParser.parseString(json).getAsJsonArray();
@@ -800,20 +1011,6 @@ public class EarthMcApiClient {
             }
         }
         return TownOverclaimProjection.NONE;   // stays safe for as long as we can see
-    }
-
-    private int computeTownActive(JsonObject t) {
-        java.util.List<String> ids = extractResidentIds(t);
-        int n = ids.size();
-        if (n == 0) return 0;
-        if (n > MAX_RESIDENT_LOOKUP) return -1;
-        long now = System.currentTimeMillis();
-        java.util.List<Long> dates = collectRemovalDates(ids, now);
-        if (dates == null) return -1;                    // a batch failed → unreliable
-        int returned = dates.size();
-        int activeReturned = 0;
-        for (long d : dates) if (d > now) activeReturned++;
-        return activeReturned + (n - returned);          // opted-out residents are omitted → counted active
     }
 
     private static java.util.List<String> extractResidentIds(JsonObject obj) {
@@ -1017,17 +1214,43 @@ public class EarthMcApiClient {
         }
     }
 
+    /**
+     * Inflates the body when the server honoured our gzip request; returns plain text otherwise.
+     *
+     * <p>Java's HttpClient neither asks for compression nor decompresses it, so without this every
+     * call took the full uncompressed response. A 100-name /towns reply is 323 KB raw against 82 KB
+     * gzipped, and the stats sweeps send dozens to hundreds of those, so this is the difference
+     * between a leaderboard costing tens of megabytes and costing a few.
+     */
+    private static String decodeBody(HttpResponse<byte[]> resp) throws java.io.IOException {
+        boolean gzip = resp.headers().firstValue("Content-Encoding")
+                .map(v -> v.toLowerCase(java.util.Locale.ROOT).contains("gzip")).orElse(false);
+        byte[] body = resp.body();
+        if (!gzip) return new String(body, java.nio.charset.StandardCharsets.UTF_8);
+        try (java.util.zip.GZIPInputStream in =
+                     new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(body))) {
+            return new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        }
+    }
+
     private String post(String url, String body) {
+        if (!apiAllowed(url)) return null;
+        boolean earthMc = needsApiKey(url);
         try {
-            HttpRequest req = HttpRequest.newBuilder()
+            HttpRequest.Builder builder = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .timeout(java.time.Duration.ofSeconds(15))
                     .header("Content-Type", "application/json")
-                    .header("User-Agent", "TownyMapAddon/1.0 (Fabric Mod)")
-                    .POST(HttpRequest.BodyPublishers.ofString(body))
-                    .build();
-            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() == 200) return resp.body();
+                    .header("User-Agent", net.townymap.util.UserAgent.get())
+                    .header("Accept-Encoding", "gzip")
+                    .POST(HttpRequest.BodyPublishers.ofString(body));
+            if (earthMc) builder.header("Authorization", "Bearer " + apiKey);
+            HttpResponse<byte[]> resp = http.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
+            if (resp.statusCode() == 200) return decodeBody(resp);
+            if (earthMc && (resp.statusCode() == 401 || resp.statusCode() == 403)) {
+                noteKeyRefused(resp.statusCode());
+                return null;
+            }
             // 404 just means "no such entity" (an opt-out, usually) and is expected; logging one line per
             // lookup buried the log. 429 means we are rate-limited and every other request is failing too,
             // so say that once rather than several hundred times.
@@ -1048,15 +1271,22 @@ public class EarthMcApiClient {
     }
 
     private String get(String url) {
+        if (!apiAllowed(url)) return null;
+        boolean earthMc = needsApiKey(url);
         try {
-            HttpRequest req = HttpRequest.newBuilder()
+            HttpRequest.Builder builder = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .timeout(java.time.Duration.ofSeconds(20))
-                    .header("User-Agent", "TownyMapAddon/1.0 (Fabric Mod)")
-                    .GET()
-                .build();
-            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() == 200) return resp.body();
+                    .header("User-Agent", net.townymap.util.UserAgent.get())
+                    .header("Accept-Encoding", "gzip")
+                    .GET();
+            if (earthMc) builder.header("Authorization", "Bearer " + apiKey);
+            HttpResponse<byte[]> resp = http.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
+            if (resp.statusCode() == 200) return decodeBody(resp);
+            if (earthMc && (resp.statusCode() == 401 || resp.statusCode() == 403)) {
+                noteKeyRefused(resp.statusCode());
+                return null;
+            }
             LOGGER.warn("[TownyMap] EarthMC API {} -> HTTP {}", url, resp.statusCode());
         } catch (Exception e) {
             LOGGER.warn("[TownyMap] EarthMC API request failed: {}", e.getMessage());
@@ -1448,7 +1678,13 @@ public class EarthMcApiClient {
                 JsonArray q = new JsonArray();
                 q.add(name);
                 body.add("query", q);
-                JsonElement root = JsonParser.parseString(postGated(url, body.toString()));
+                String json = postGated(url, body.toString());
+                // Null means the request was never sent -- no key, or a key already refused. Parsing
+                // it threw an NPE that the catch below dressed up as "Full lookup failed for Egypt:
+                // Cannot invoke String.length()", which reads like EarthMC broke rather than like a
+                // request this client correctly declined to make.
+                if (json == null) return null;
+                JsonElement root = JsonParser.parseString(json);
                 if (!root.isJsonArray() || root.getAsJsonArray().isEmpty()) return null;
                 JsonElement first = root.getAsJsonArray().get(0);
                 return first.isJsonObject() ? parser.apply(first.getAsJsonObject()) : null;
@@ -1468,6 +1704,10 @@ public class EarthMcApiClient {
                 q.add(townName);
                 body.add("query", q);
                 String json = postGated(BASE + "/towns", body.toString());
+                // Null means the request was never sent -- no key, or the key is known-refused.
+                // Parsing it threw, and the catch below reported that as "Failed to fetch", which
+                // is a warning per keyless lookup for a request that was correctly held back.
+                if (json == null) return null;
                 JsonElement root = JsonParser.parseString(json);
                 if (!root.isJsonArray() || root.getAsJsonArray().isEmpty()) return null;
                 JsonElement first = root.getAsJsonArray().get(0);

@@ -99,9 +99,9 @@ java {
 }
 
 tasks.withType(JavaCompile).configureEach {
-    options.release = name == 'compileEncodeBorders' ? 21 : 25
     // 源码含中文字面量，必须显式用 UTF-8 编译
     options.encoding = 'UTF-8'
+    options.release = name == 'compileEncodeBorders' ? 21 : 25
 }
 
 jar {
