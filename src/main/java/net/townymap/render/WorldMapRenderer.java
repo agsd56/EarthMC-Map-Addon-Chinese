@@ -189,12 +189,25 @@ public class WorldMapRenderer {
     private boolean outlineTilesSmooth = true;     // outline STYLE baked into the current tiles
     private int outlineTilesFavVersion = -1;        // favourites baked into the current tiles
     private int outlineTilesStatusVersion = -1;     // status-highlight exclusion baked into the current tiles
+    private int outlineTilesFlashVersion = -1;      // search-flash borders baked into the current HIGHLIGHT tiles
 
     // Towns the active status mode highlights. They are EXCLUDED from the tile bake and drawn live in the
     // animated status colour instead, so the highlight is a single flush line (no baked line under it).
     // statusVersion bumps when this set changes → tiles rebuild, exactly like favouritesVersion.
     private Set<String> statusHighlightKeys = Set.of();
+    /**
+     * Claims whose border is currently being drawn in the search-flash colour. They ride the SAME
+     * highlight layer as the map modes, which is what makes the flash a replacement: a town is baked
+     * into exactly one layer, so its own colour is gone for the duration instead of sitting under a
+     * second white line. Empty while a map mode is on -- moving a town onto that layer there would
+     * paint it in the mode's colour and claim it qualifies for the mode when it may not.
+     */
+    private Set<String> flashKeys = Set.of();
     private int statusVersion = 0;
+    /** Bumped when the search flash starts or ends. Deliberately NOT statusVersion: that one re-partitions
+     *  both layers and drops every baked tile, which is what made the map visibly re-render the moment the
+     *  blink stopped. A flash only ever adds or removes a border on the highlight layer. */
+    private int flashVersion = 0;
     private int lastStatusMode = -1;
     private int lastStatusDetailsSize = -1;
     private int lastStatusFavVersion = -1;
@@ -224,6 +237,11 @@ public class WorldMapRenderer {
     /** HTTP status of a recent squaremap tile refusal, or 0 when the imagery is loading normally. */
     public int tileRefusalStatus() {
         return squaremapTiles.recentRefusalStatus();
+    }
+
+    /** Why the squaremap layer is blank, or null while it is drawing. */
+    public String imageryProblem() {
+        return squaremapTiles.imageryProblem();
     }
 
     /** Drops every cached squaremap tile — used when the map switches world. */
@@ -480,6 +498,7 @@ public class WorldMapRenderer {
         double worldBottom = cameraZ + sh / 2.0 / blockScale;
 
         refreshStatusHighlightKeys(townDetails);
+        refreshFlashKeys();
 
         // ── Outline strategy: exactly squaremap's ────────────────────────────────
         // The smooth (DP + anti-aliased) tile path owns the outlines at every zoom where a chunk is small
@@ -503,8 +522,12 @@ public class WorldMapRenderer {
                                                sw, sh, worldLeft, worldRight, worldTop, worldBottom)) {
             // Highlight layer on top, tinted with the live (optionally animating) colour. Blitted after the
             // main layer so it sits above the outlines it is highlighting.
-            if (isHighlightMode()) {
-                renderTownOutlineTiles(ctx, statusTiles, 0xFF000000 | statusHighlightRgb(),
+            if (isHighlightMode() || !flashKeys.isEmpty()) {
+                // The tint is applied at blit time, so the flash's pulse costs no re-bake at all.
+                int tint = flashKeys.isEmpty()
+                        ? 0xFF000000 | statusHighlightRgb()
+                        : net.townymap.render.SearchFlash.tint();
+                renderTownOutlineTiles(ctx, statusTiles, tint,
                                        cameraX, cameraZ, blockScale, sw, sh,
                                        worldLeft, worldRight, worldTop, worldBottom);
             }
@@ -533,9 +556,16 @@ public class WorldMapRenderer {
             // town.key() is already lower-cased, so no per-town String allocation here.
             boolean favorite = haveFavorites && favoriteTownKeys.contains(town.key());
             boolean statusHighlighted = overlayOn && isStatusHighlighted(town, townDetails);
+            // Zoomed in past the tile path (or waiting on a re-bake), so there is no layer to swap --
+            // but the colour decision below is the same one, and overriding it here IS the replacement.
+            boolean flashing = flashKeys.contains(town.key());
             // One colour encodes everything → one outline pass (favourite > status > the town's own colour).
             // Favourites differ from other towns only in COLOUR, never in opacity.
-            int outlineColor = favorite ? ((strokeAlpha << 24) | 0xFFE066)
+            // Only while the blink is ON -- off-beat it falls through to the town's own colour, which is
+            // what the tiled path shows too now that the real border stays baked underneath.
+            int flashColor = flashing ? net.townymap.render.SearchFlash.tint() : 0;
+            int outlineColor = (flashColor >>> 24) > 0 ? flashColor
+                    : favorite ? ((strokeAlpha << 24) | 0xFFE066)
                     : statusHighlighted ? (0xFF000000 | statusRgb)
                     : ((strokeAlpha << 24) | (town.data().rgbColor() & 0xFFFFFF));
             // Interior uses the town's FILL colour (nation fill), not the outline colour — except
@@ -562,6 +592,51 @@ public class WorldMapRenderer {
             // 4 (Meganations) and 5 (Alliances) are not single-colour highlights — they recolour the source.
             default -> false;
         };
+    }
+
+    /**
+     * Picks up the search flash and invalidates the outline bake when it starts or ends, so the claim
+     * actually moves between tile layers. Until the new tiles are ready the tile path reports "not
+     * handled" and the direct path draws instead, which applies the same colour override -- so the swap
+     * is seamless rather than showing the old colour until the bake catches up.
+     */
+    private void refreshFlashKeys() {
+        Set<String> next = isHighlightMode() ? Set.of() : net.townymap.render.SearchFlash.activeTownKeys();
+        if (next.equals(flashKeys)) return;
+        flashKeys = next;
+        flashVersion++;
+    }
+
+    /** Which towns the map mode highlights and which are flashing, snapshotted for one frame's bake. */
+    private record Highlights(Set<String> status, Set<String> flash) {}
+
+    /**
+     * Draws the search flash live, for the one case the tile path cannot serve: a map mode is on.
+     *
+     * <p>The highlight tile layer carries one tint for everything on it, so a flash sharing it with
+     * Public/Overclaim/Open would blink every highlighted town white, not just the one searched for.
+     * flashKeys is held empty in that case to keep the mode intact -- which used to mean the search had
+     * no feedback at all once the halo was dropped. One town's border drawn here is a handful of calls,
+     * on the renderer's own ring geometry, so it still lands exactly on the border it replaces.
+     *
+     * <p>Called from the late pass: these are {@code ctx.fill} lines and the outline tiles are textured
+     * quads, which paint straight over them inside a single batch.
+     */
+    public void renderSearchFlashOutline(DrawContext ctx, double cameraX, double cameraZ,
+                                         double blockScale, int sw, int sh) {
+        if (config == null || blockScale <= 0 || !isHighlightMode()) return;
+        Set<String> keys = net.townymap.render.SearchFlash.activeTownKeys();
+        if (keys.isEmpty()) return;
+        int color = net.townymap.render.SearchFlash.tint();
+        if ((color >>> 24) == 0) return;   // mid-blink: the town's own border is what shows
+        TownRenderCache snapshot = townRenderCache;
+        for (String key : keys) {
+            RenderTown town = snapshot.byName().get(key);
+            if (town == null) continue;
+            for (RingGeometry ring : town.rings()) {
+                renderRing(ctx, ring, 0, color, 0, null, cameraX, cameraZ, blockScale, sw, sh);
+            }
+        }
     }
 
     /** The single-colour highlight modes (Public/Overclaim/Open). Modes 4/5 recolour the source instead. */
@@ -640,26 +715,36 @@ public class WorldMapRenderer {
                                            double worldTop, double worldBottom) {
         layer.tint = tint;
         TownRenderCache snapshot = townRenderCache;
-        if (snapshot != outlineTilesSnapshot || favoritesVersion != outlineTilesFavVersion
+        boolean structural = snapshot != outlineTilesSnapshot
+                || favoritesVersion != outlineTilesFavVersion
                 || statusVersion != outlineTilesStatusVersion
-                || config.smoothTownOutlines != outlineTilesSmooth) {
+                || config.smoothTownOutlines != outlineTilesSmooth;
+        if (structural || flashVersion != outlineTilesFlashVersion) {
             // Style is part of what a tile contains, and the cache key has no spare bits (16 zoom + 24 tx
             // + 24 ty fills the long), so toggling smooth/blocky must drop the cache or the old style
             // would keep being blitted. Toggling is a settings action, so the re-bake cost is irrelevant.
             // Both layers are invalidated together: which towns are highlighted decides how the two are
             // partitioned, so a stale half would double-draw or drop towns. The highlight COLOUR is not in
             // here on purpose — it is applied as a blit tint, so changing it costs no re-bake at all.
-            clearOutlineTiles(mainTiles);
+            // A flash is the exception to "both layers together": a flashing claim stays baked normally on
+            // the main layer the whole time and the highlight layer merely carries a white border over it,
+            // so starting or ending one drops that layer alone. The main layer never notices, which is why
+            // the map no longer falls back to the direct path when the blink stops.
+            if (structural) clearOutlineTiles(mainTiles);
             clearOutlineTiles(statusTiles);
             outlineTilesSmooth = config.smoothTownOutlines;
             outlineTilesSnapshot = snapshot;
             outlineTilesFavVersion = favoritesVersion;
             outlineTilesStatusVersion = statusVersion;
+            outlineTilesFlashVersion = flashVersion;
         }
         if (snapshot.allTowns().isEmpty()) return true;   // nothing to draw, but still "handled" (no direct)
         processOutlineTileUploads(layer);
         Set<String> favSnapshot = favoriteTownKeys.isEmpty() ? Set.of() : Set.copyOf(favoriteTownKeys);
-        Set<String> statusSnapshot = statusHighlightKeys;   // already immutable (Set.of() / Set.copyOf)
+        // Kept apart, not unioned: a map-mode town moves to the highlight layer whole, while a flashed
+        // claim is split across both -- interior on the main layer in its own colour, border on the
+        // highlight layer to be tinted. A union cannot express that difference.
+        Highlights highlightSets = new Highlights(statusHighlightKeys, flashKeys);
 
         // Rasterise at PHYSICAL pixel density (like the browser's devicePixelRatio canvas): the zoom
         // bucket is chosen from blockScale × GUI scale, so ppb below is physical px per block and the
@@ -686,7 +771,7 @@ public class WorldMapRenderer {
             if (now - layer.pendingSinceMs < OUTLINE_ZOOM_SETTLE_MS) {
                 drawCoarserFallback(ctx, layer, zoom, cameraX, cameraZ, blockScale, sw, sh,
                                     worldLeft, worldRight, worldTop, worldBottom,
-                                    density, snapshot, favSnapshot, statusSnapshot);
+                                    density, snapshot, favSnapshot, highlightSets);
                 return true;
             }
         }
@@ -701,7 +786,7 @@ public class WorldMapRenderer {
                 long key = outlineTileKey(zoom, tx, ty);
                 if (!layer.tiles.containsKey(key) && !layer.empty.contains(key)) {
                     requestOutlineTile(layer, key, zoom, tx, ty, tileWorldSize, ppb, density,
-                                       snapshot, favSnapshot, statusSnapshot);
+                                       snapshot, favSnapshot, highlightSets);
                     allReady = false;
                 }
             }
@@ -728,7 +813,7 @@ public class WorldMapRenderer {
         } else {
             drawCoarserFallback(ctx, layer, zoom, cameraX, cameraZ, blockScale, sw, sh,
                                 worldLeft, worldRight, worldTop, worldBottom,
-                                density, snapshot, favSnapshot, statusSnapshot);
+                                density, snapshot, favSnapshot, highlightSets);
         }
         if (allReady) layer.lastReadyZoom = zoom;
 
@@ -743,7 +828,7 @@ public class WorldMapRenderer {
                                      double blockScale, int sw, int sh, double worldLeft, double worldRight,
                                      double worldTop, double worldBottom, double density,
                                      TownRenderCache snapshot, Set<String> favSnapshot,
-                                     Set<String> statusSnapshot) {
+                                     Highlights highlightSets) {
         // Stand in with the last fully-ready level. (Picking the "nearest cached" level instead was tried
         // and reverted: which level is nearest changes as tiles bake and evict, so the stand-in hopped
         // between levels frame to frame and made every town flicker.)
@@ -754,7 +839,7 @@ public class WorldMapRenderer {
         }
         drewOverviewFloor(ctx, layer, cameraX, cameraZ, blockScale, sw, sh,
                           worldLeft, worldRight, worldTop, worldBottom,
-                          density, snapshot, favSnapshot, statusSnapshot);
+                          density, snapshot, favSnapshot, highlightSets);
     }
 
     /** Blits whatever is cached at {@code zoom}, scaled to the current view. Partial coverage is drawn
@@ -797,7 +882,7 @@ public class WorldMapRenderer {
                                    int sw, int sh, double worldLeft, double worldRight,
                                    double worldTop, double worldBottom, double density,
                                    TownRenderCache snapshot, Set<String> favSnapshot,
-                                   Set<String> statusSnapshot) {
+                                   Highlights highlightSets) {
         int ovZoom = overviewOutlineZoom();
         double ovPpb = outlineTilePixelsPerBlock(ovZoom);
         double ovTileWorld = OUTLINE_TILE_PIXELS / ovPpb;
@@ -813,7 +898,7 @@ public class WorldMapRenderer {
                     blitOutlineTile(ctx, layer, tex, tx, ty, ovTileWorld, cameraX, cameraZ, blockScale, sw, sh);
                 } else if (!layer.empty.contains(key)) {
                     requestOutlineTile(layer, key, ovZoom, tx, ty, ovTileWorld, ovPpb, density,
-                                       snapshot, favSnapshot, statusSnapshot);
+                                       snapshot, favSnapshot, highlightSets);
                 }
             }
         }
@@ -828,18 +913,19 @@ public class WorldMapRenderer {
 
     private void requestOutlineTile(TileLayer layer, long key, int zoom, int tx, int ty, double tileWorldSize, double ppb,
                                     double density, TownRenderCache snapshot, Set<String> favSnapshot,
-                                    Set<String> statusSnapshot) {
+                                    Highlights highlightSets) {
         if (layer.loading.size() >= MAX_OUTLINE_TILE_LOADS) return;
         if (!layer.loading.add(key)) return;
         // Stamp the versions this tile is being baked with, so a tile that finishes after the favourite or
         // status-exclusion set changes is rejected on upload instead of showing a stale exclusion.
         int favVer = outlineTilesFavVersion;
         int statVer = outlineTilesStatusVersion;
+        int flashVer = outlineTilesFlashVersion;
         outlineTileExecutor.execute(() -> {
             try {
-                NativeImage img = rasterizeOutlineTile(layer, zoom, tx, ty, tileWorldSize, ppb, density, snapshot, favSnapshot, statusSnapshot);
+                NativeImage img = rasterizeOutlineTile(layer, zoom, tx, ty, tileWorldSize, ppb, density, snapshot, favSnapshot, highlightSets);
                 if (img == null) layer.empty.add(key);
-                else layer.completed.add(new LoadedOutlineTile(key, snapshot, img, favVer, statVer));
+                else layer.completed.add(new LoadedOutlineTile(key, snapshot, img, favVer, statVer, flashVer));
             } catch (Exception e) {
                 LOGGER.warn("[TownyMap] Failed to rasterise town outline tile: {}", e.getMessage());
             } finally {
@@ -850,7 +936,7 @@ public class WorldMapRenderer {
 
     private NativeImage rasterizeOutlineTile(TileLayer layer, int zoom, int tx, int ty, double tileWorldSize, double ppb,
                                              double density, TownRenderCache snapshot, Set<String> favSnapshot,
-                                             Set<String> statusSnapshot) {
+                                             Highlights highlightSets) {
         double tileWorldX = tx * tileWorldSize;
         double tileWorldZ = ty * tileWorldSize;
         double pad = tileWorldSize * 0.02;
@@ -919,8 +1005,18 @@ public class WorldMapRenderer {
                 // Each layer bakes only its own towns, through the SAME rasteriser — so a highlighted
                 // town's line is pixel-identical to its neighbours', which stroking it live could never
                 // achieve (a ctx.fill line cannot be an anti-aliased sub-pixel stroke over a soft fill).
-                boolean statusHit = statusSnapshot.contains(town.key());
-                if (layer.statusLayer != statusHit) continue;
+                boolean statusHit = highlightSets.status().contains(town.key());
+                boolean flashHit = highlightSets.flash().contains(town.key());
+                // A map-mode town moves to the highlight layer whole. A flashed claim does not move at
+                // all: it stays baked normally on the main layer, and the highlight layer carries a white
+                // copy of its BORDER to blit over the top. That is what keeps the main layer untouched for
+                // the whole flash -- and it means the blink alternates between white and the town's own
+                // colour rather than white and nothing, since the real border is still underneath.
+                boolean onLayer = layer.statusLayer ? (statusHit || flashHit) : !statusHit;
+                if (!onLayer) continue;
+                // Every layer a town appears on draws its border; only the FILL is layer-specific.
+                boolean flashOnly = layer.statusLayer && flashHit && !statusHit;
+                boolean drawFill = layer.statusLayer ? (statusHit && !flashOnly) : true;
                 // Favourites are baked exactly like every other town — identical thin stroke, identical
                 // translucent fill — only the COLOUR differs (gold). Previously they also got a fully
                 // opaque line, which made them shout next to the ~65%-alpha neighbours.
@@ -973,11 +1069,15 @@ public class WorldMapRenderer {
                     anyRing = true;
                 }
                 if (anyRing) {
-                    if (bakeFill) {
+                    if (bakeFill && drawFill) {
                         g.setColor(awtColor((fillAlphaT << 24) | fillRgb));
                         g.fill(path);
+                        drew = true;
                     }
-                    g.setColor(awtColor((strokeAlphaT << 24) | rgb));
+                    // The flash border sits ON TOP of the town's own, same path and same stroke, so it
+                    // has to be fully opaque: at the baked ~65% it would blend with the colour beneath and
+                    // come out a washed tint instead of white.
+                    g.setColor(awtColor(((flashOnly ? 0xFF : strokeAlphaT) << 24) | rgb));
                     g.draw(path);
                     drew = true;
                 }
@@ -1085,8 +1185,9 @@ public class WorldMapRenderer {
             if (loaded.snapshot() != outlineTilesSnapshot
                     || loaded.favVersion() != outlineTilesFavVersion
                     || loaded.statusVersion() != outlineTilesStatusVersion
+                    || loaded.flashVersion() != outlineTilesFlashVersion
                     || layer.tiles.containsKey(loaded.key())) {
-                loaded.image().close();   // stale (data/favourites/status changed) or duplicate
+                loaded.image().close();   // stale (data/favourites/status/flash changed) or duplicate
                 continue;
             }
             try {
@@ -1199,7 +1300,7 @@ public class WorldMapRenderer {
     }
 
     private record LoadedOutlineTile(long key, TownRenderCache snapshot, NativeImage image,
-                                     int favVersion, int statusVersion) {}
+                                     int favVersion, int statusVersion, int flashVersion) {}
 
     private static final class OutlineTileTexture extends NativeImageBackedTexture {
         private OutlineTileTexture(java.util.function.Supplier<String> name, NativeImage image) {
@@ -1352,7 +1453,9 @@ public class WorldMapRenderer {
     }
 
     private boolean isFavorite(String townName) {
-        return favoriteTownKeys.contains(townName == null ? "" : townName.toLowerCase(Locale.ROOT));
+        // Asked per town per frame, and lowercasing allocates. Nothing to match against an empty set.
+        if (favoriteTownKeys.isEmpty() || townName == null) return false;
+        return favoriteTownKeys.contains(townName.toLowerCase(Locale.ROOT));
     }
 
     private int statusHighlightRgb() {
@@ -1916,12 +2019,21 @@ public class WorldMapRenderer {
             nationStarHits = List.of();
             return;
         }
-        if (!config.townsEnabled || !config.nationStarsEnabled || nationDetails.isEmpty()) {
+        if (!config.townsEnabled || !config.nationStarsEnabled) {
             nationStarHits = List.of();
             return;
         }
         MinecraftClient client = MinecraftClient.getInstance();
         if (client == null) return;
+
+        // With no API nation data -- no key, or it has not loaded yet -- the map still names every
+        // capital: its tooltip reads "(Capital of X)". That is the whole of what a capital star needs,
+        // so the stars no longer wait on a request that may never be allowed to go out.
+        if (nationDetails.isEmpty()) {
+            renderMapCapitalStars(ctx, client, cameraX, cameraZ, blockScale, sw, sh,
+                    worldLeft, worldRight, worldTop, worldBottom);
+            return;
+        }
 
         ArrayList<StarHit> hits = new ArrayList<>();
         for (EarthMcNationData nation : nationDetails.values()) {
@@ -1954,6 +2066,40 @@ public class WorldMapRenderer {
 
             ctx.drawText(client.textRenderer, "★", x - 3, y - 5, 0xFFFFD84D, true);
             hits.add(new StarHit(x, y, nation.name()));   // record where it landed for click hit-testing
+        }
+        nationStarHits = hits.isEmpty() ? List.of() : List.copyOf(hits);
+    }
+
+    /**
+     * Capital stars drawn from the map alone.
+     *
+     * <p>Positioned on the capital's own claim rather than the nation spawn the API would give, which
+     * is the more honest spot for a star that means "this town is the capital" -- and the only one
+     * available off Earth anyway.
+     */
+    private void renderMapCapitalStars(DrawContext ctx, MinecraftClient client,
+                                       double cameraX, double cameraZ, double blockScale, int sw, int sh,
+                                       double worldLeft, double worldRight,
+                                       double worldTop, double worldBottom) {
+        Map<String, String> capitals = api.nationCapitals();
+        if (capitals.isEmpty()) {
+            nationStarHits = List.of();
+            return;
+        }
+        ArrayList<StarHit> hits = new ArrayList<>();
+        for (Map.Entry<String, String> e : capitals.entrySet()) {
+            TownData capital = townByName(e.getValue());
+            if (capital == null) continue;   // no claim in the world being shown
+            double markerX = capital.centerX();
+            double markerZ = capital.centerZ();
+            if (markerX < worldLeft || markerX > worldRight
+                    || markerZ < worldTop || markerZ > worldBottom) continue;
+            int x = toScreenX(markerX, cameraX, blockScale, sw);
+            int y = toScreenY(markerZ, cameraZ, blockScale, sh);
+            if (x < -10 || x > sw + 10 || y < -10 || y > sh + 10) continue;
+            ctx.drawText(client.textRenderer, "\u2605", x - 3, y - 5, 0xFFFFD84D, true);
+            // The nation name the hit test wants is the map's own spelling, not the lower-cased key.
+            hits.add(new StarHit(x, y, api.getTownNation(e.getValue().toLowerCase(Locale.ROOT))));
         }
         nationStarHits = hits.isEmpty() ? List.of() : List.copyOf(hits);
     }

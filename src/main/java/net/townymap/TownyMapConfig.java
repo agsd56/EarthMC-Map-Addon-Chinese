@@ -23,6 +23,25 @@ public class TownyMapConfig {
     public boolean playersEnabled = true;
     public boolean earthmcOnly = true;
     /**
+     * EarthMC API key, minted in game by {@code /api key create} and handed back afterwards by
+     * {@code /api key copy}.
+     *
+     * <p>A secret. It is never written to the log and never leaves api.earthmc.net -- the mod also
+     * talks to map.earthmc.net, GitHub, the Wayback Machine, mc-heads and the alliance source, and
+     * none of them ever see it. Empty means every API-backed feature is off, which is what EarthMC
+     * itself will do from 2026-11-19; the map, its borders, town names and players need no key and
+     * keep working either way.
+     */
+    public String earthMcApiKey = "";
+    /**
+     * Whether the one-time "you can add an API key" notice has been shown.
+     *
+     * <p>Persisted rather than per-launch: it is a nudge, not a reminder, and the status line above
+     * the map already says so for as long as there is no key. Set once the notice has actually been
+     * put on screen, so a crash before that still leaves it to be shown.
+     */
+    public boolean apiKeyNoticeShown = false;
+    /**
      * Kept as a gate throughout the minimap rendering, but no longer user-facing: the settings row was
      * removed, so {@code sanitize()} forces it back on. Without that, anyone whose config had it off
      * would have no way left to turn the minimap overlay back on.
@@ -44,11 +63,28 @@ public class TownyMapConfig {
     /**
      * Which minimap background the player indicator is drawn over: 0 = never draw ours, 1 = only when
      * the EMC overlay is on, 2 = only when it's off (Xaero's own terrain), 3 = both. Xaero draws its
-     * arrow before our overlay, so the EMC layer hides it and ours stands in; over Xaero's terrain ours
-     * lands on its own arrow. Note that 0 leaves no arrow at all while the EMC layer is on, since the
-     * one Xaero draws is underneath it.
+     * arrow before our overlay, so the EMC layer hides it and ours stands in; over Xaero's own terrain
+     * its arrow is already there and ours only lands on top of it.
+     * <p>
+     * Hence the default of 1. Modes 2 and 3 ask our arrow to be a pixel-exact copy of one that is
+     * already on screen, which means matching Xaero's sprite, its 0.25x ARROW_SCALE sizing and its
+     * north-lock -- two of those read by reflection into Xaero's own config. When any of it drifts the
+     * only thing the user sees is two arrows at two sizes, so the mode's entire visible effect is its
+     * failure mode. Was 3 up to 1.4.11; see {@link #indicatorModeDefaultMigrated}.
+     * <p>
+     * Note that 0 leaves no arrow at all while the EMC layer is on, since the one Xaero draws is
+     * underneath it.
      */
-    public int minimapIndicatorMode = 3;
+    public int minimapIndicatorMode = 1;
+    /**
+     * One-time marker for the {@link #minimapIndicatorMode} default dropping from 3 ("Both") to 1
+     * ("EMC") in 1.4.12. Gson writes out every field, so every config saved before that change pins
+     * the old default and would never pick up the new one. The field is absent from those configs, so
+     * it deserialises false and {@code sanitize()} moves that one value across exactly once; a config
+     * born after the change is marked in {@code load()}, and anyone who picks "Both" deliberately
+     * afterwards keeps it.
+     */
+    public boolean indicatorModeDefaultMigrated = false;
     public boolean minimapNationAlertEnabled = true;
     public boolean minimapTownNamesEnabled = true;
     // ── Info display (text lines under the minimap, stacked with Xaero's coords) ──
@@ -113,6 +149,15 @@ public class TownyMapConfig {
     // keeping it centred on the camera) so you can zoom out to see the whole EarthMC map. On by default.
     public boolean worldMapOverview = true;
     public boolean nationStarsEnabled = true;
+    /**
+     * Right-clicking unclaimed ground looks the spot up and opens the town panel, the way it did
+     * before 1.4.11, instead of letting the click reach Xaero.
+     *
+     * <p>Off by default. Xaero's own right-click menu is the only way to add a waypoint, teleport or
+     * share a location from the world map, and on empty ground that is worth more than a panel telling
+     * you the ground is empty. Claimed land is unaffected either way: it has always been ours.
+     */
+    public boolean wildernessTownInfo = false;
     /** Show a nation's join-range zone on the world map when it's selected: a 5k circle around the capital
      *  plus a 1.5k circle around every town, whose union is where a town could join that nation. */
     public boolean nationRangeEnabled = true;
@@ -146,6 +191,25 @@ public class TownyMapConfig {
     /** Starred nations and players. Towns had this from the start; the other two kinds behave the same. */
     public List<String> favoriteNations = new ArrayList<>();
     public List<String> favoritePlayers = new ArrayList<>();
+    /**
+     * The entities you last opened from a search box, newest first. They live under the search bar's
+     * filter hints, which scroll to reveal them. Kinds are the same strings the favourites lists use,
+     * so one resolver serves both.
+     */
+    public List<RecentSearch> recentSearches = new ArrayList<>();
+    /** Off stops recording. What is already stored stays until it's cleared explicitly, so toggling
+     *  this off and on again doesn't quietly throw the list away. */
+    public boolean recordSearchHistory = true;
+
+    /**
+     * One remembered search: what was opened and when, never where it was. A town's centre moves as it
+     * claims and unclaims, so the jump is resolved fresh from the live town list every time instead of
+     * from a position frozen at the moment you searched.
+     */
+    public record RecentSearch(String kind, String name, long atMs) {}
+
+    /** How many searches are kept. The stack shows four rows at a time, so ten is a couple of scrolls. */
+    public static final int MAX_RECENT_SEARCHES = 10;
     /**
      * squaremap world the saved selection was drawn in. Chunk keys are raw coordinates with no world
      * attached, so without this a selection made on Terra Nostra reappeared over the Moon. Defaults to
@@ -221,8 +285,30 @@ public class TownyMapConfig {
     public String worldsUrl() {
         return squaremapBaseUrl + "/tiles/settings.json";
     }
+    /** EarthMC's own copy of the live player feed, on the API host. See {@link #playersUrl()}. */
+    public static final String PLAYERS_URL = "https://api.earthmc.net/map/v1/players";
+
+    /**
+     * Live player positions, taken from the map's own document again.
+     *
+     * <p>This was moved to {@link #PLAYERS_URL} on 2026-11-03, when EarthMC appeared to have dropped
+     * the map's copy. The map's copy is serving live data again -- verified 2026-11-13: both carry the
+     * same seven fields per player, and over 40 seconds about 40 of the 85 players common to both had
+     * moved in each. Preferring it keeps the busiest poll in the mod off the API host entirely, where
+     * it needs no key and spends none of EarthMC's API budget.
+     *
+     * <p>It follows {@code squaremapBaseUrl} because it is a squaremap document once more. That was
+     * the reason the API form was a fixed URL -- a redirected base must never capture a request that
+     * carries credentials -- and it no longer applies: nothing authenticates here.
+     */
     public String playersUrl() {
         return squaremapBaseUrl + "/tiles/players.json";
+    }
+
+    /** EarthMC's copy, used only while the map's is failing. This feed has changed hosts once already,
+     *  so the other one is kept rather than assumed gone. */
+    public String playersFallbackUrl() {
+        return PLAYERS_URL;
     }
 
     // ── Persistence ──────────────────────────────────────────────────────────
@@ -241,8 +327,18 @@ public class TownyMapConfig {
             }
         }
         TownyMapConfig defaults = new TownyMapConfig();
+        defaults.indicatorModeDefaultMigrated = true; // born with the new default; nothing to move
         defaults.save();
         return defaults;
+    }
+
+    /** Tolerates a key pasted with the header prefix still on it, or with stray whitespace -- both
+     *  are easy to pick up copying out of chat or a web page. Never logs the value. */
+    public static String normalizeApiKey(String raw) {
+        if (raw == null) return "";
+        String k = raw.trim();
+        if (k.regionMatches(true, 0, "Bearer ", 0, 7)) k = k.substring(7).trim();
+        return k;
     }
 
     private boolean sanitize() {
@@ -259,6 +355,25 @@ public class TownyMapConfig {
             squaremapBackgroundMode = 0;
             changed = true;
         }
+        // The player indicator's default dropped from "Both" to "EMC": over Xaero's own terrain ours
+        // was never anything but a copy of the arrow Xaero had already drawn. Gson persists every
+        // field, so an existing config pins the old default and has to be moved by hand. Once only,
+        // and only from that exact value, so a deliberate "Both" survives.
+        if (!indicatorModeDefaultMigrated) {
+            if (minimapIndicatorMode == 3) minimapIndicatorMode = 1;
+            indicatorModeDefaultMigrated = true;
+            changed = true;
+        }
+        if (minimapIndicatorMode < 0 || minimapIndicatorMode > 3) {
+            minimapIndicatorMode = 1;
+            changed = true;
+        }
+        String normalizedKey = normalizeApiKey(earthMcApiKey);
+        if (!normalizedKey.equals(earthMcApiKey)) {
+            earthMcApiKey = normalizedKey;
+            changed = true;
+        }
+
         // No control for this any more, so a config that still has it off would be permanently stuck.
         if (!minimapExtensionsEnabled) {
             minimapExtensionsEnabled = true;
@@ -294,7 +409,9 @@ public class TownyMapConfig {
             borderOverlayMode = 0;
             changed = true;
         }
-        if (townStatusOverlayMode < 0 || townStatusOverlayMode > 5) {
+        // Was > 5, which silently reset Planning (6) to None on every load -- the cycle has offered it
+        // since planning mode was added, so it never survived a restart. 7 is Ice Highways.
+        if (townStatusOverlayMode < 0 || townStatusOverlayMode > 7) {
             townStatusOverlayMode = 0;
             changed = true;
         }
@@ -317,6 +434,23 @@ public class TownyMapConfig {
         }
         if (favoriteNations == null) favoriteNations = new ArrayList<>();
         if (favoritePlayers == null) favoritePlayers = new ArrayList<>();
+        // A hand-edited or half-written history must not reach the renderer: a null name there would
+        // draw a row that cannot be clicked, and an over-long list would climb the screen.
+        if (recentSearches == null) {
+            recentSearches = new ArrayList<>();
+            changed = true;
+        } else {
+            ArrayList<RecentSearch> cleaned = new ArrayList<>();
+            for (RecentSearch r : recentSearches) {
+                if (r == null || r.kind() == null || r.name() == null || r.name().isBlank()) continue;
+                cleaned.add(r);
+                if (cleaned.size() >= MAX_RECENT_SEARCHES) break;
+            }
+            if (!cleaned.equals(recentSearches)) {
+                recentSearches = cleaned;
+                changed = true;
+            }
+        }
         if (favoriteTowns == null) {
             favoriteTowns = new ArrayList<>();
             changed = true;
@@ -474,7 +608,16 @@ public class TownyMapConfig {
     private static final java.util.Set<String> PRESERVED_ON_RESET = java.util.Set.of(
             "favoriteTowns", "favoriteNations", "favoritePlayers",
             "chunkCounterSelection", "chunkCounterGroups",
-            "activeChunkCounterGroup", "chunkCounterGroupCount");
+            "activeChunkCounterGroup", "chunkCounterGroupCount",
+            // Not a setting, and re-issuing one is a trip in game: "Reset All" must not throw it away.
+            "earthMcApiKey",
+            // Bookkeeping: resetting the options should not make the first-run notice reappear.
+            "apiKeyNoticeShown",
+            // What the user has collected, not a setting: resetting the options should not empty it.
+            "recentSearches",
+            // Bookkeeping. Copying a fresh false over it would re-run the migration and could drag a
+            // deliberate "Both" back to "EMC" one launch later.
+            "indicatorModeDefaultMigrated");
 
     /**
      * Copies every persisted field of this config into {@code target}. "Reset All" uses a freshly

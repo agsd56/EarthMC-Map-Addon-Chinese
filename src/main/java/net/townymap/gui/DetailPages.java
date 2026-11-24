@@ -507,6 +507,47 @@ public final class DetailPages {
         return out;
     }
 
+    /**
+     * The same panel from the keyless record, for when {@code /v4} will not answer.
+     *
+     * <p>Without a key the expanded panel used to say "Nothing found" for a town whose popup --
+     * still on screen behind it -- was happily showing mayor, board, bank and claims. The popup had
+     * a fallback to {@code /map/v1/town} and this path did not, so the same town was both known and
+     * missing depending on which way you opened it.
+     *
+     * <p>What /map/v1 does not carry is left out rather than drawn blank: no resident roll, no
+     * trusted or outlaw lists, no spawn, no claim limit, no founder, and no flags beyond pvp and
+     * public. A reader gets what EarthMC will give away for free and is not told the rest is empty.
+     */
+    public static Page town(net.townymap.model.MapTownData m) {
+        List<DetailScreen.Block> b = new ArrayList<>();
+        boolean hasNation = m.nation() != null && !m.nation().isBlank();
+        boolean hasMayor = m.mayor() != null && !m.mayor().isBlank() && !m.mayor().equals("?");
+
+        b.add(new Cols(List.of(
+                new Col("市长", hasMayor ? m.mayor() : "—",
+                        hasMayor ? new Ref(Kind.PLAYER, m.mayor()) : null),
+                new Col("建立", m.founded() == null || m.founded().isBlank() ? "—" : m.founded()),
+                new Col("国家", hasNation ? m.nation() : "—",
+                        hasNation ? new Ref(Kind.NATION, m.nation()) : null))));
+        addAllianceBlocks(b, hasNation ? m.nation() : "");
+
+        if (m.board() != null && !m.board().isBlank()) b.add(new DetailScreen.Wide("公告板", m.board()));
+        b.add(new Rule());
+
+        // No claim limit here, unlike the keyed page: /map/v1 gives the count and not the maximum,
+        // and "12 / ?" reads like a failure rather than a thing EarthMC withholds.
+        b.add(new Cols(List.of(
+                new Col("规模", m.claims() + " 区块"),
+                new Col("银行", money(m.balance())),
+                new Col("居民", String.valueOf(m.residents())))));
+        b.add(new Rule());
+        b.add(chips("公开", m.isPublic(), "PVP", m.pvp()));
+
+        return new Page(Kind.TOWN, m.name(), hasNation ? m.nation() : "无国家", b,
+                DiscordUrl.normalize(m.discord()), null);
+    }
+
     public static Page town(TownFullData t) {
         List<DetailScreen.Block> b = new ArrayList<>();
 
@@ -645,6 +686,50 @@ public final class DetailPages {
         b.add(new Cols(cols));
         String sub = town == null || town.isBlank() ? "" : role.toLowerCase(java.util.Locale.ROOT) + " · " + town;
         return new Page(Kind.PLAYER, name, sub, b, "", "");
+    }
+
+    /**
+     * A nation panel from the map alone, for when {@code /v4} will not answer.
+     *
+     * <p>EarthMC published a keyless endpoint for towns and nothing else, so unlike the town panel
+     * this has no request to fall back on. It is built the way {@link #alliance} is instead, out of
+     * the towns the map is already drawing: each carries its nation and its capital flag in the
+     * squaremap tooltip -- the same source the capital stars read when no key is set -- so a
+     * nation's town roll, its capital and its claimed area all come free.
+     *
+     * <p>Residents, bank, king, founding date, allies and ranks are nation-level and live only
+     * behind the key. They are left out rather than drawn empty.
+     *
+     * <p>Returns null when no town on the map claims the name, which is the honest answer for a
+     * nation that is misspelt, fallen, or simply not loaded yet.
+     */
+    public static Page mapNation(String nationName) {
+        if (nationName == null || nationName.isBlank()) return null;
+        String want = nationName.trim();
+        String display = want;
+        String capital = "";
+        int chunks = 0;
+        List<String> towns = new ArrayList<>();
+        for (TownData t : TownyMapMod.currentTowns()) {
+            String n = TownyMapMod.townNationOf(t.key());
+            if (n == null || !n.trim().equalsIgnoreCase(want)) continue;
+            display = n.trim();                     // the map's spelling of it, not the caller's
+            towns.add(t.name());
+            chunks += t.approximateChunks();
+            if (TownyMapMod.isTownCapital(t.key())) capital = t.name();
+        }
+        if (towns.isEmpty()) return null;
+        towns.sort(String.CASE_INSENSITIVE_ORDER);
+
+        List<DetailScreen.Block> b = new ArrayList<>();
+        b.add(new Cols(List.of(
+                new Col("首都", orDash(capital), capital.isBlank() ? null : new Ref(Kind.TOWN, capital)),
+                new Col("城镇", String.valueOf(towns.size())),
+                new Col("区块", String.format("%,d", chunks)))));
+        addAllianceBlocks(b, display);
+        b.add(new Rule());
+        addNames(b, "城镇", towns, Kind.TOWN);
+        return new Page(Kind.NATION, display, towns.size() + " 个城镇", b, "", "");
     }
 
     /** The Expand panel for an ARCHIVED nation — derived entirely from that date's member towns: the towns

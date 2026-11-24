@@ -96,6 +96,17 @@ public final class TownyMinimapOverlay {
     private static long cachedWaypointCollectAtMs;
     private static List<Waypoint> cachedMinimapWaypoints = List.of();
     private static boolean lastRenderCanCoverWaypoints;
+
+    /**
+     * Whether this frame's minimap draw actually painted over the terrain, and so over Xaero's
+     * waypoints with it.
+     *
+     * <p>Read by the native-waypoint suppression, which runs after our draw and before Xaero's. The two
+     * have to agree: suppressing a pass we then decline to replace is how waypoints disappear.
+     */
+    public static boolean lastRenderCoveredWaypoints() {
+        return lastRenderCanCoverWaypoints;
+    }
     /**
      * Blocks-per-block factor the minimap was actually drawn at this frame, for the waypoint layer.
      * 1.0 normally. In the Nether with "Overworld Coords" the town overlay and the squaremap tiles are
@@ -1528,8 +1539,10 @@ public final class TownyMinimapOverlay {
         if (config == null || !config.minimapExtensionsEnabled) return;
         if (session.getProcessor().isCaveModeDisplayed()) return;
         // Which background the user wants the indicator over. Xaero draws its own arrow before our
-        // overlay, so with the EMC layer on it's hidden and ours is the only one; with the layer off
-        // ours lands on top of Xaero's, matching its sprite and scale, so they read as one arrow.
+        // overlay, so with the EMC layer on it's hidden and ours is the only one. With the layer off
+        // Xaero's arrow is visible and ours is laid over it, matching its sprite and scale so the two
+        // read as one -- which is why mode 1 is the default and that second case is opt-in: being an
+        // exact copy is the best it can do, and anything less shows up as two arrows.
         boolean emcLayer = config.squaremapOnMinimap();
         switch (config.minimapIndicatorMode) {
             case 0 -> { return; }
@@ -1871,21 +1884,10 @@ public final class TownyMinimapOverlay {
         if (now - lastMinimapShapeReadAtMs < MINIMAP_SHAPE_CACHE_MS) return cachedMinimapShape;
         lastMinimapShapeReadAtMs = now;
 
-        try {
-            Class<?> hudModClass = Class.forName("xaero.common.HudMod");
-            Object hudMod = hudModClass.getField("INSTANCE").get(null);
-            Object hudConfigs = hudModClass.getMethod("getHudConfigs").invoke(hudMod);
-            Object manager = hudConfigs.getClass().getMethod("getClientConfigManager").invoke(hudConfigs);
-            Class<?> optionsClass = Class.forName("xaero.hud.minimap.common.config.option.MinimapProfiledConfigOptions");
-            Object shapeOption = optionsClass.getField("SHAPE").get(null);
-            Object value = getXaeroProfileOption(manager, shapeOption);
-            if (value instanceof Number number) {
-                cachedMinimapShape = number.intValue();
-                return cachedMinimapShape;
-            }
-        } catch (ReflectiveOperationException | RuntimeException | LinkageError ignored) {
+        if (xaeroOption(false) instanceof Number number) {
+            cachedMinimapShape = number.intValue();
+            return cachedMinimapShape;
         }
-
         cachedMinimapShape = readMinimapShapeFromConfig(cachedMinimapShape);
         return cachedMinimapShape;
     }
@@ -1903,6 +1905,40 @@ public final class TownyMinimapOverlay {
         long now = System.currentTimeMillis();
         if (now - lastArrowOptionReadAtMs < MINIMAP_SHAPE_CACHE_MS) return cachedArrowScale;
         lastArrowOptionReadAtMs = now;
+        // Leave the cached value alone if the read fails; it starts at 1.0.
+        if (xaeroOption(true) instanceof Number n && n.doubleValue() > 0) {
+            cachedArrowScale = n.doubleValue();
+        }
+        return cachedArrowScale;
+    }
+
+    // ── Xaero's config, resolved once ────────────────────────────────────────
+
+    private static Object xaeroConfigManager;
+    private static java.lang.reflect.Method xaeroGetEffective;
+    private static Object xaeroShapeOption;
+    private static Object xaeroArrowScaleOption;
+    /** 0, not Long.MIN_VALUE: the check below is a subtraction, and now - Long.MIN_VALUE
+     *  overflows to a large negative, which reads as "attempted a moment ago" for ever. */
+    private static long xaeroResolveAttemptedAt = 0L;
+
+    /**
+     * Resolves Xaero's config manager and the two options read per frame.
+     *
+     * <p>All of it is fixed for the session, but it used to be looked up on every read: a class load,
+     * four reflective lookups, and -- through {@code getMethods()} -- a fresh copy of the manager
+     * class's entire method array, ten times a second for each of two options. Resolving once leaves
+     * a single {@code invoke} on the per-frame path.
+     *
+     * <p>Retried on a timer rather than latched on first failure: Xaero's {@code HudMod.INSTANCE} is
+     * not populated the instant our class loads, and giving up then would leave the minimap guessing
+     * its shape from the config file for the rest of the session.
+     */
+    private static boolean resolveXaeroConfig() {
+        if (xaeroConfigManager != null) return true;
+        long now = System.currentTimeMillis();
+        if (now - xaeroResolveAttemptedAt < 5_000L) return false;
+        xaeroResolveAttemptedAt = now;
         try {
             Class<?> hudModClass = Class.forName("xaero.common.HudMod");
             Object hudMod = hudModClass.getField("INSTANCE").get(null);
@@ -1910,24 +1946,37 @@ public final class TownyMinimapOverlay {
             Object manager = hudConfigs.getClass().getMethod("getClientConfigManager").invoke(hudConfigs);
             Class<?> optionsClass = Class.forName(
                     "xaero.hud.minimap.common.config.option.MinimapProfiledConfigOptions");
-            Object scaleOption = optionsClass.getField("ARROW_SCALE").get(null);
-            Object value = getXaeroProfileOption(manager, scaleOption);
-            if (value instanceof Number n && n.doubleValue() > 0) {
-                cachedArrowScale = n.doubleValue();
+            java.lang.reflect.Method effective = null;
+            for (var method : manager.getClass().getMethods()) {
+                if ("getEffective".equals(method.getName()) && method.getParameterCount() == 1) {
+                    effective = method;
+                    break;
+                }
             }
+            if (effective == null) return false;
+            xaeroShapeOption = optionsClass.getField("SHAPE").get(null);
+            xaeroArrowScaleOption = optionsClass.getField("ARROW_SCALE").get(null);
+            xaeroGetEffective = effective;
+            xaeroConfigManager = manager;   // set last: nothing is usable until all of it resolved
+            return true;
         } catch (ReflectiveOperationException | RuntimeException | LinkageError ignored) {
-            // Leave the cached value alone; it starts at 1.0.
+            return false;
         }
-        return cachedArrowScale;
     }
 
-    private static Object getXaeroProfileOption(Object manager, Object option)
-            throws ReflectiveOperationException {
-        for (var method : manager.getClass().getMethods()) {
-            if (!"getEffective".equals(method.getName()) || method.getParameterCount() != 1) continue;
-            return method.invoke(manager, option);
+    /**
+     * Reads one of Xaero's two per-frame options. Named rather than passed by reference: the option
+     * objects do not exist until {@link #resolveXaeroConfig()} has run, so a caller reading the field
+     * to pass it in would hand over a null on the very first call.
+     */
+    private static Object xaeroOption(boolean arrowScale) {
+        if (!resolveXaeroConfig()) return null;
+        try {
+            return xaeroGetEffective.invoke(xaeroConfigManager,
+                    arrowScale ? xaeroArrowScaleOption : xaeroShapeOption);
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError ignored) {
+            return null;
         }
-        return null;
     }
 
     private static int readMinimapShapeFromConfig(int fallback) {

@@ -36,6 +36,7 @@ import net.townymap.model.TownData;
 import net.townymap.model.TownPopupData;
 import net.townymap.render.TownyMinimapOverlay;
 import net.townymap.render.WorldMapRenderer;
+import net.townymap.render.WorldMapWaypoints;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import xaero.hud.minimap.common.config.MinimapConfigConstants;
@@ -63,7 +64,6 @@ public class TownyMapMod implements ClientModInitializer {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final Type TOWN_CACHE_TYPE = new TypeToken<Map<String, TownPopupData>>() {}.getType();
     private static final long TOWN_DETAILS_SAVE_DELAY_MS = 2_000L;
-    private static final long TOWN_DETAILS_MAX_AGE_MS = 60_000L;
     private static final long DETAIL_REQUEST_DEFER_MS = 2_000L;
     private static final long OPTIMISTIC_CLAIM_TTL_MS = 20_000L;
     private static final long PENDING_CLAIM_TTL_MS = 12_000L;
@@ -89,14 +89,12 @@ public class TownyMapMod implements ClientModInitializer {
     private static double lastWorldMapScale = Double.NaN;
     private static long worldMapMovingUntilMs = 0;
     private static final Map<String, TownPopupData> townDetailsCache = new ConcurrentHashMap<>();
-    private static final Map<String, Long> townDetailsFetchedAt = new ConcurrentHashMap<>();
     private static final Set<String> townDetailsLoading = ConcurrentHashMap.newKeySet();
     private static final Map<String, Long> townDetailsDeferredAt = new ConcurrentHashMap<>();
-    // On-demand active-resident counts (the bulk last-login lookup), kept OFF the mass town/nation
-    // fetch so the map's bulk fetches stay cheap. Only the focused/searched town & nation are looked
-    // up here. Value -1 = looked up but unavailable (e.g. over the resident cap) — cached to avoid re-firing.
-    private static final Map<String, Integer> townActiveCache = new ConcurrentHashMap<>();
-    private static final Set<String> townActiveLoading = ConcurrentHashMap.newKeySet();
+    // On-demand per-resident last-login lookups, kept OFF the mass fetches. Nations only now: the
+    // bonus-drop projection needs each resident's own purge date and nothing else carries it. Towns
+    // no longer appear here -- their active count arrives with the base town fetch, for nothing.
+    // Value -1 = looked up but unavailable (e.g. over the resident cap) — cached to avoid re-firing.
     private static final Map<String, Integer> nationActiveCache = new ConcurrentHashMap<>();
     private static final Map<String, NationBonusProjection> nationBonusProjCache = new ConcurrentHashMap<>();
     private static final Map<String, net.townymap.model.TownOverclaimProjection> townOverclaimCache = new ConcurrentHashMap<>();
@@ -157,6 +155,11 @@ public class TownyMapMod implements ClientModInitializer {
         config     = TownyMapConfig.load();
         apiClient  = new SquaremapApiClient(config);
         earthMcApi = new EarthMcApiClient();
+        earthMcApi.setApiKey(config.earthMcApiKey);
+        // One /authtest at startup. Nothing else can tell a good key from a bad one before 2026-11-19
+        // -- the data endpoints answer a bogus key with 200 today -- so without this a typo would sit
+        // there looking healthy until the morning everything stopped.
+        if (earthMcApi.hasApiKey()) earthMcApi.verifyKey();
         renderer   = new WorldMapRenderer(config, apiClient);
         ChunkCounterOverlay.loadSelection(config.chunkCounterSelection,
                 config.chunkCounterGroups, config.activeChunkCounterGroup);
@@ -168,15 +171,18 @@ public class TownyMapMod implements ClientModInitializer {
         ClientSendMessageEvents.COMMAND.register(TownyMapMod::onCommandSent);
         ClientReceiveMessageEvents.GAME.register(TownyMapMod::onGameMessage);
         net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.END_CLIENT_TICK
-                .register(c -> net.townymap.integration.ShopWaypoints.tick());
+                .register(c -> { net.townymap.integration.ShopWaypoints.tick(); tickApiKeyCapture(); });
 
         LOGGER.info("TownyMap Addon ready; map refreshes are deferred until map/minimap rendering is active ({})", config.squaremapBaseUrl);
     }
 
     private static void onCommandSent(String command) {
-        if (apiClient == null || !isActiveOnCurrentServer()) return;
         String normalized = command.trim().toLowerCase(Locale.ROOT);
         if (normalized.startsWith("/")) normalized = normalized.substring(1);
+        // Ahead of the gate, for the same reason the capture hook in onGameMessage is: the window
+        // was opened by the player seconds ago and must not be swallowed by a server check.
+        if (normalized.startsWith("api key copy")) net.townymap.api.ApiKeyCapture.noteCopyRequested();
+        if (apiClient == null || !isActiveOnCurrentServer()) return;
         if (isTownClaimCommand(normalized)) {
             rememberPendingClaim();
         } else if (isTownUnclaimCommand(normalized)) {
@@ -188,7 +194,18 @@ public class TownyMapMod implements ClientModInitializer {
     }
 
     private static void onGameMessage(Text message, boolean overlay) {
-        if (apiClient == null || !isActiveOnCurrentServer() || message == null) return;
+        if (message == null) return;
+        // Ahead of every other gate on purpose. The window is opened by the player, in settings,
+        // seconds earlier -- so it outranks "EarthMC Only" and the access check, both of which would
+        // otherwise swallow the one reply the player opened it for. Overlay lines are the action bar
+        // and never carry a command's output.
+        if (!overlay && net.townymap.api.ApiKeyCapture.armed()) {
+            // The whole message, not its visible text: /api key copy hands the key over in a
+            // click-to-copy event, where getString() would show only the words on the line.
+            String found = net.townymap.api.ApiKeyCapture.findKey(message);
+            if (found != null) { acceptCapturedApiKey(found); return; }
+        }
+        if (apiClient == null || !isActiveOnCurrentServer()) return;
         // Shop results are independent of the claim flow, so they have to be read before the
         // pending-claim early return below or they'd only ever parse right after a /town claim.
         if (net.townymap.integration.ShopWaypoints.onGameMessage(message.getString())) return;
@@ -269,16 +286,22 @@ public class TownyMapMod implements ClientModInitializer {
      */
     private static void applyApiTownClaims(net.townymap.api.EarthMcApiClient.TownClaims claims) {
         if (config == null || apiClient == null) return;
-        String world = playerWorldResolved();
-        TownData onMap = townByName(claims.name());
+        // The overworld, not the world the player happens to be standing in: coordinates.townBlocks is
+        // the town's EARTH claim and nothing else. Checked against the live API -- Amsterdam's 569 chunks
+        // match its Terra Nostra outline exactly and its Moon claim is not among them. Taking the
+        // player's world here would write Earth chunks into the Moon's town list.
+        String world = WORLD_OVERWORLD;
+        TownData onMap = townByName(claims.name(), world);
         if (onMap == null) return;   // a town the map has never shown: nothing to re-shape
 
         java.util.List<int[][]> rings = net.townymap.util.ChunkRings.trace(claims.chunks());
         if (rings.isEmpty()) return;
         apiClient.overrideTownGeometry(world, onMap.withRings(rings));
 
-        // Anything the old overlay left for this town is now part of the outline.
-        optimisticClaimChunks.removeIf(c -> claims.name().equalsIgnoreCase(c.townName()));
+        // Anything the old overlay left for this town is now part of the outline -- on this world only,
+        // since a Moon claim the player just made is not described by what the API just told us.
+        optimisticClaimChunks.removeIf(c -> claims.name().equalsIgnoreCase(c.townName())
+                && c.inWorld(world));
         invalidateTownRenderCaches();
     }
 
@@ -358,6 +381,17 @@ public class TownyMapMod implements ClientModInitializer {
     /**
      * Your own EarthMC record, for the dashboard's town/nation card. Reuses the same cache the pending
      * claim tracker fills, so in most sessions it is already there; otherwise one lookup for one name.
+     *
+     * <p>The lookup goes through {@link #requestPlayerDetails}, which is the only reason this is safe to
+     * call from where it is called. Every caller sits on a per-frame path -- isAccessBlocked() reaches
+     * it from the minimap's own render, and the dashboard calls it while it draws -- and the bare
+     * fetchPlayer that used to be here had no in-flight guard, no failure backoff and no negative
+     * caching, so for as long as the record was missing it posted to /players once per frame. A fast
+     * reply filled the cache within a few frames and hid that; a slow one let the burst cross EarthMC's
+     * 180/min limit, after which every reply was a 429, nothing was ever cached, the record never
+     * arrived and the loop sustained itself at full frame rate. A heap dump caught 3.2 million queued
+     * lookups holding a 5 GiB heap at 100%. requestPlayerDetails already carries the in-flight set and
+     * the failure backoff every other player lookup uses; this just stops going around it.
      */
     public static EarthMcPlayerData selfPlayer() {
         MinecraftClient client = MinecraftClient.getInstance();
@@ -365,9 +399,7 @@ public class TownyMapMod implements ClientModInitializer {
         String selfName = client.getSession().getUsername();
         EarthMcPlayerData cached = playerDetailsCache.get(townKey(selfName));
         if (cached == null && earthMcApi != null && isActiveOnCurrentServer()) {
-            earthMcApi.fetchPlayer(selfName).thenAccept(d -> {
-                if (d != null) cachePlayerDetails(townKey(selfName), d);
-            });
+            requestPlayerDetails(selfName);
         }
         return cached;
     }
@@ -497,11 +529,17 @@ public class TownyMapMod implements ClientModInitializer {
     }
 
     private static TownData townByName(String townName) {
-        if (apiClient == null || townName == null) return null;
         // The player's world: this seeds the colours of a chunk they just claimed, which happens where
         // they stand. Reading the shown world meant claiming on Earth with the map pinned to the Moon
         // found no town and fell back to default colours.
-        for (TownData town : apiClient.getTowns(playerWorldResolved())) {
+        return townByName(townName, playerWorldResolved());
+    }
+
+    /** The same lookup against a named world. Town names repeat across worlds -- every Moon town shares
+     *  its name with an Earth one -- so anything world-specific has to say which it means. */
+    private static TownData townByName(String townName, String world) {
+        if (apiClient == null || townName == null) return null;
+        for (TownData town : apiClient.getTowns(world)) {
             if (town.name().equalsIgnoreCase(townName)) return town;
         }
         return null;
@@ -532,6 +570,14 @@ public class TownyMapMod implements ClientModInitializer {
     public static MapDataStatus mapDataStatus() {
         if (apiClient == null) return new MapDataStatus("领地数据不可用", STATUS_BAD);
         if (apiClient.isArchiveActive()) return new MapDataStatus("存档快照", STATUS_ARCHIVE);
+        // Claims come from the map and need no key, so this is not "unavailable" -- but with no usable
+        // key every API-backed panel is empty, and this line is the first place anyone looks.
+        if (earthMcApi != null && !earthMcApi.keyState().usable()) {
+            return new MapDataStatus(
+                    earthMcApi.keyState() == net.townymap.api.ApiKeyState.MISSING
+                            ? "需要 API 密钥——请查看设置" : "API 密钥被拒绝——请查看设置",
+                    STATUS_BAD);
+        }
 
         long ok = apiClient.lastClaimsSuccessMs();
         if (ok == 0) {
@@ -550,6 +596,14 @@ public class TownyMapMod implements ClientModInitializer {
         int refused = renderer != null ? renderer.tileRefusalStatus() : 0;
         if (refused != 0) {
             return new MapDataStatus("地图影像被拒绝 (HTTP " + refused + ")", STATUS_BAD);
+        }
+        // A refusal is the only tile failure that ever reached the screen. Everything after the HTTP
+        // status -- a timeout, a decode error, an upload error, an upload the frame budget never got to
+        // -- drew a dark map and said nothing at all, which is indistinguishable from the layer being
+        // switched off and is how one of these ran for a week undiagnosed.
+        String imagery = renderer != null ? renderer.imageryProblem() : null;
+        if (imagery != null) {
+            return new MapDataStatus(imagery, STATUS_BAD);
         }
         // Claims reload every 60s, so anything past two intervals means something is quietly wrong.
         return new MapDataStatus("领地 " + age, ageSec > 150 ? STATUS_STALE : STATUS_OK);
@@ -683,7 +737,10 @@ public class TownyMapMod implements ClientModInitializer {
     // Selectable map modes. "Overclaim" (2) is omitted until EarthMC's API exposes active-resident
     // counts — its claim max is wrong without them, so over-claim detection misfires. The case is kept
     // (commented) in the highlight switch and labels so it can be re-enabled later.
-    private static final int[] STATUS_MODES = {0, 1, 2, 3, 4, 5, 6};   // 6 = Planning
+    /** Map mode that draws the ice highway network. Unlike 1-5 it recolours nothing: it is a layer over
+     *  the towns, not a way of colouring them, which is why nothing else in here tests for it. */
+    public static final int ICE_HIGHWAYS_MODE = 7;
+    private static final int[] STATUS_MODES = {0, 1, 2, 3, 4, 5, 6, 7};   // 6 = Planning, 7 = Ice Highways
 
     /** Advance the map-mode value to the next/previous selectable mode, skipping disabled ones. */
     public static int nextStatusMode(int current, boolean backward) {
@@ -727,6 +784,11 @@ public class TownyMapMod implements ClientModInitializer {
     private static volatile boolean allianceLoading = false;
     private static volatile long allianceLoadedMs = 0;
     private static volatile int allianceDataVersion = 0;
+    private static final long ALLIANCE_REFRESH_MS = 300_000L;
+    private static final long ALLIANCE_RETRY_MIN_MS = 30_000L;
+    private static final long ALLIANCE_RETRY_MAX_MS = 600_000L;
+    /** How long to wait after a failed load, doubling each time it keeps failing. */
+    private static volatile long allianceRetryMs = ALLIANCE_RETRY_MIN_MS;
     private static volatile Map<String, int[]> megaByNation = Map.of();       // nation(lower) → {outline,fill}
     private static volatile Map<String, int[]> allianceByNation = Map.of();
     private static volatile Map<String, List<String>> megaNamesByNation = Map.of();     // nation → meganation labels
@@ -743,6 +805,12 @@ public class TownyMapMod implements ClientModInitializer {
     /** The nation a town belongs to (from the squaremap tooltips), or null if it is nationless. */
     public static String townNationOf(String townKey) {
         return townNationAt(townKey);
+    }
+
+    /** Whether a town is its nation's capital, from the same tooltip. Needs no key, which is why the
+     *  capital stars keep working without one. */
+    public static boolean isTownCapital(String townKey) {
+        return apiClient != null && apiClient.isTownCapital(townKey);
     }
 
     // ── Clean map screenshot ─────────────────────────────────────────────────
@@ -935,20 +1003,34 @@ public class TownyMapMod implements ClientModInitializer {
         return m.get(nationBare.toLowerCase(Locale.ROOT));
     }
 
-    /** A town's nation name with any "Capital of " prefix stripped, for matching against alliance rosters. */
+    /**
+     * A town's nation by town NAME rather than key, for the alliance layers.
+     *
+     * <p>It used to strip a "Capital of " prefix as well, because the squaremap tooltip's nation was
+     * stored in that form and a capital matched no alliance roster. The prefix is now split off at the
+     * parse (see SquaremapApiClient.POPUP_NATION), so every caller gets the plain name and this is only
+     * the name-keyed convenience.
+     */
     public static String bareTownNation(String townName) {
         if (apiClient == null || townName == null) return null;
         String n = townNationAt(townKey(townName));
-        if (n == null) return null;
-        if (n.regionMatches(true, 0, "Capital of ", 0, 11)) n = n.substring(11);
-        return n.trim();
+        return n == null ? null : n.trim();
     }
 
-    /** Loads the alliance/meganation data if the cache is missing or stale (5 min). Called every frame the
-     *  map is open so the map modes, town menus and nation search always have it; self-throttles. */
+    /**
+     * Loads the alliance/meganation data if the cache is missing or stale. Called every frame the map is
+     * open so the map modes, town menus and nation search always have it; self-throttles.
+     *
+     * <p>The wait applies whether the last attempt worked or not. It used to be conditional on already
+     * having data, which meant a failed load left the throttle disengaged: the next frame tried again,
+     * and the next, for as long as the source stayed down. A profile log caught 209 requests in 18
+     * seconds doing exactly that -- fast enough to be what got us refused in the first place, after
+     * which every reply was a refusal and the loop sustained itself.
+     */
     public static void ensureAllianceData() {
         if (allianceLoading) return;
-        if (allianceDataVersion > 0 && System.currentTimeMillis() - allianceLoadedMs < 300_000L) return;
+        long wait = allianceDataVersion > 0 ? ALLIANCE_REFRESH_MS : allianceRetryMs;
+        if (allianceLoadedMs > 0 && System.currentTimeMillis() - allianceLoadedMs < wait) return;
         allianceLoading = true;
         java.util.concurrent.CompletableFuture.runAsync(() -> {
             List<net.townymap.api.AllianceClient.Alliance> list = allianceClient.fetch();
@@ -956,7 +1038,13 @@ public class TownyMapMod implements ClientModInitializer {
             Runnable apply = () -> {
                 allianceLoading = false;
                 allianceLoadedMs = System.currentTimeMillis();
-                if (list.isEmpty()) return;
+                if (list.isEmpty()) {
+                    // Back off further each time, so a source that is down for a while is asked about
+                    // once every ten minutes rather than steadily.
+                    allianceRetryMs = Math.min(ALLIANCE_RETRY_MAX_MS, allianceRetryMs * 2);
+                    return;
+                }
+                allianceRetryMs = ALLIANCE_RETRY_MIN_MS;
                 Map<String, int[]> mega = new java.util.HashMap<>(), alli = new java.util.HashMap<>();
                 Map<String, List<String>> megaNames = new java.util.HashMap<>(), alliNames = new java.util.HashMap<>();
                 for (net.townymap.api.AllianceClient.Alliance a : list) {
@@ -1092,6 +1180,14 @@ public class TownyMapMod implements ClientModInitializer {
         for (PlayerMarker m : apiClient.getPlayers(worldKey)) {
             if (m.name() != null) feed.add(m.name().toLowerCase(Locale.ROOT));
         }
+        // Who is still connected. getPlayerInfo(name) walks the whole tab list for each call, and on
+        // EarthMC that list runs to hundreds -- asking it once per surviving history entry was the
+        // single most expensive thing the minimap did. One pass builds the same answer.
+        Set<String> online = new java.util.HashSet<>();
+        for (var info : handler.getPlayerList()) {
+            String n = info.getProfile().name();
+            if (n != null) online.add(n.toLowerCase(Locale.ROOT));
+        }
         Map<String, net.townymap.model.PlayerHistoryEntry> history = apiClient.getPlayerHistory();
 
         List<GhostMarker> out = new ArrayList<>();
@@ -1101,7 +1197,7 @@ public class TownyMapMod implements ClientModInitializer {
             var h = e.getValue();
             long age = now - h.lastSeenMs();
             if (age < 0 || age > GHOST_MAX_AGE_MS) continue;
-            if (handler.getPlayerListEntry(h.name()) == null) continue;   // logged off → remove
+            if (h.name() == null || !online.contains(h.name().toLowerCase(Locale.ROOT))) continue;  // logged off
             out.add(new GhostMarker(h.name(), h.uuid(), h.x(), h.z(), 0xFF));
         }
 
@@ -1239,6 +1335,28 @@ public class TownyMapMod implements ClientModInitializer {
         suppressNextPanClear = true;
     }
 
+    /**
+     * Xaero's own waypoints, redrawn over our map layer.
+     *
+     * <p>Called from the renderPreDropdown pass with XAERO's camera and scale, not the overlay's: the
+     * waypoint coordinates are in Xaero's map space already. See {@link WorldMapWaypoints} for why
+     * redrawing is the only option.
+     */
+    public static void renderWorldMapWaypoints(DrawContext ctx, double cameraX, double cameraZ,
+                                               double guiScale, int screenW, int screenH) {
+        if (!isActiveOnCurrentServer()) return;
+        try {
+            WorldMapWaypoints.render(ctx, cameraX, cameraZ, guiScale, screenW, screenH);
+        } catch (Exception | LinkageError e) {
+            // One-shot: a throw here must not take the map's whole late pass down with it.
+            if (worldMapWaypointsErrorLogged.compareAndSet(false, true)) {
+                LOGGER.warn("[TownyMap] Failed to redraw world-map waypoints", e);
+            }
+        }
+    }
+
+    private static final AtomicBoolean worldMapWaypointsErrorLogged = new AtomicBoolean(false);
+
     public static void renderOnWorldMap(DrawContext ctx,
                                         double cameraX, double cameraZ,
                                         double scale, int screenW, int screenH) {
@@ -1255,6 +1373,12 @@ public class TownyMapMod implements ClientModInitializer {
                     townDetailsCache, playerDetailsCache, activeNationDetails());
             if (config.customOverlaysEnabled) {
                 net.townymap.integration.CustomOverlayManager.render(ctx, cameraX, cameraZ, scale, screenW, screenH);
+            }
+            // Only fetched once the mode is selected: nobody pays for a layer they do not use.
+            if (config.townStatusOverlayMode == ICE_HIGHWAYS_MODE) {
+                net.townymap.integration.CustomOverlayManager.ensureIceHighways();
+                net.townymap.integration.CustomOverlayManager.renderIceHighways(
+                        ctx, cameraX, cameraZ, scale, screenW, screenH);
             }
         }
     }
@@ -1288,10 +1412,11 @@ public class TownyMapMod implements ClientModInitializer {
         if (!(composingScreenshot() && !screenshotWantsPlayers())) {
             renderer.renderPlayersLayer(ctx, cameraX, cameraZ, scale, screenW, screenH, playerDetailsCache);
         }
-        // Last, so the flash lands over the claim tiles and the dots alike. A transient "look here" marker
-        // has no business in a shared screenshot, so it sits out the clean capture.
+        // The search flash normally rides the renderer's highlight tiles, but that layer has one tint and
+        // a map mode owns it. This covers that case live. A transient marker has no place in a shared
+        // picture of the map, so it sits out the clean capture.
         if (!composingScreenshot()) {
-            net.townymap.render.SearchFlash.render(ctx, cameraX, cameraZ, scale, screenW, screenH);
+            renderer.renderSearchFlashOutline(ctx, cameraX, cameraZ, scale, screenW, screenH);
         }
     }
 
@@ -1302,14 +1427,9 @@ public class TownyMapMod implements ClientModInitializer {
      */
     public static void flashSearchTarget(net.townymap.model.MapJumpTarget target) {
         if (target == null || config == null || !config.searchFlash) return;
+        // Only claims flash. A player's jump answers with its zoom; there is no border to take over, and
+        // a marker invented for one was just a second thing to look at.
         net.townymap.render.SearchFlash.arm(target.highlightTowns(), currentTowns());
-        if (net.townymap.render.SearchFlash.active()) return;
-        // Nothing resolved to a claim -- a player's live position, or a town the map hasn't drawn. Ring
-        // the spot itself so the jump still points somewhere rather than silently doing nothing.
-        if (target.hasExtent()) {
-            net.townymap.render.SearchFlash.armPoint(target.x(), target.z(),
-                    Math.max(target.spanX(), target.spanZ()));
-        }
     }
 
     /**
@@ -1514,23 +1634,37 @@ public class TownyMapMod implements ClientModInitializer {
         return suppress;
     }
 
-    /** While our squaremap overlay is active we draw waypoints ourselves (on top), so hide Xaero's. */
     /**
-     * Deliberately mirrors the condition guarding our own redraw, including the cave-mode check: the
-     * overlay bails out in cave mode and never redraws, so suppressing there made waypoints vanish
-     * entirely instead of being replaced.
+     * While our overlay is drawing we render waypoints ourselves on top of it, so Xaero's native
+     * minimap waypoint pass is suppressed to avoid drawing each one twice.
+     *
+     * <p>Every condition here mirrors one guarding our own redraw, because suppressing a pass we then
+     * decline to replace is precisely how waypoints disappear. Cave mode was mirrored from the start;
+     * the enlarged map and the "did we actually paint over anything" flag were not, so on the enlarged
+     * minimap, and whenever our layer drew nothing that frame, Xaero's waypoints were taken away and
+     * nothing put them back.
+     *
+     * <p>{@code lastRenderCoveredWaypoints()} replaces the old squaremapOnMinimap() test rather than
+     * joining it: it is the redraw's own signal, it is set by our draw earlier in the same frame
+     * (renderOnMinimap runs before renderOutsidePip, inside which this fires), and it is true for the
+     * chunk counter and for claim fills as well -- cases the old test missed, where each waypoint was
+     * being drawn twice instead.
      */
     public static void setSuppressNativeMinimapWaypoints(Object session) {
         boolean caveMode = false;
+        boolean enlarged = false;
         try {
             xaero.hud.minimap.module.MinimapSession minimapSession =
                     (xaero.hud.minimap.module.MinimapSession) session;
             caveMode = minimapSession.getProcessor() != null
                     && minimapSession.getProcessor().isCaveModeDisplayed();
+            enlarged = minimapSession.getProcessor() != null
+                    && minimapSession.getProcessor().isEnlargedMap();
         } catch (Exception ignored) {
         }
         suppressNativeMinimapWaypoints.set(config != null && config.minimapExtensionsEnabled
-                && config.squaremapOnMinimap() && isActiveOnCurrentServer() && !caveMode);
+                && isActiveOnCurrentServer() && !caveMode && !enlarged
+                && net.townymap.render.TownyMinimapOverlay.lastRenderCoveredWaypoints());
     }
 
     public static void clearSuppressNativeMinimapWaypoints() {
@@ -1658,9 +1792,14 @@ public class TownyMapMod implements ClientModInitializer {
         if (config.infoDisplayTownEnabled) {
             if (here != null) {
                 String key = townKey(here.name());
-                requestTownDetails(here.name(), key);
-                TownPopupData details = townDetailsCache.get(key);
-                String nation = details != null ? details.nationName() : null;
+                // The nation is all this line wants, and the marker tooltip carries it -- so walking
+                // into a town no longer costs a request. Archive mode reads the snapshot instead: the
+                // live markers' nation is today's, not that date's.
+                String nation = isArchiveMode() ? null : apiClient.getTownNation(key);
+                if (nation == null || nation.isBlank()) {
+                    TownPopupData details = townDetailsCache.get(key);
+                    nation = details != null ? details.nationName() : null;
+                }
                 lines.add(nation != null && !nation.isBlank()
                         ? "§f城镇: " + here.name() + " §7(" + nation + ")"
                         : "§f城镇: " + here.name());
@@ -1680,17 +1819,22 @@ public class TownyMapMod implements ClientModInitializer {
             // retention buffer means the list self-corrects within a refresh and honours the Last Seen toggle.
             record Nearby(String name, double dist, boolean ghost) {}
             java.util.List<Nearby> near = new java.util.ArrayList<>();
+            // Squared distance for the test, so the 100-block filter costs a multiply rather than a
+            // Math.hypot -- which is FdLibm, far dearer than it looks -- for every marker on the feed.
+            double rangeSq = (100.0 * dimScale) * (100.0 * dimScale);
             for (PlayerMarker m : apiClient.getPlayers(hudWorld)) {
                 if (m.name() == null || m.name().equalsIgnoreCase(self)) continue;
-                double d = Math.hypot(m.x() - px, m.z() - pz) / dimScale;
-                if (d <= 100.0) near.add(new Nearby(m.name(), d, false));
+                double dx = m.x() - px, dz = m.z() - pz;
+                double dsq = dx * dx + dz * dz;
+                if (dsq <= rangeSq) near.add(new Nearby(m.name(), Math.sqrt(dsq) / dimScale, false));
             }
             // Recently-departed players at their last-seen position (red), exactly the minimap's ghost data —
             // so you can still see roughly where someone was after they drop off the live feed.
             for (GhostMarker g : lastSeenGhosts(hudWorld)) {
                 if (g.name() == null || g.name().equalsIgnoreCase(self)) continue;
-                double d = Math.hypot(g.x() - px, g.z() - pz) / dimScale;
-                if (d <= 100.0) near.add(new Nearby(g.name(), d, true));
+                double dx = g.x() - px, dz = g.z() - pz;
+                double dsq = dx * dx + dz * dz;
+                if (dsq <= rangeSq) near.add(new Nearby(g.name(), Math.sqrt(dsq) / dimScale, true));
             }
             near.sort(java.util.Comparator.comparingDouble(Nearby::dist));
             java.util.List<String> entries = new java.util.ArrayList<>();
@@ -1711,13 +1855,17 @@ public class TownyMapMod implements ClientModInitializer {
         }
 
         if (config.infoDisplayNearestTownEnabled && here == null && !towns.isEmpty()) {
+            // Nearly six thousand towns, every frame: ordering by squared distance gives the same
+            // winner and leaves exactly one square root to take, at the end.
             TownData nearest = null;
-            double best = Double.MAX_VALUE;
+            double bestSq = Double.MAX_VALUE;
             for (TownData t : towns) {
-                double d = Math.hypot(t.centerX() - px, t.centerZ() - pz) / dimScale;
-                if (d < best) { best = d; nearest = t; }
+                double dx = t.centerX() - px, dz = t.centerZ() - pz;
+                double dsq = dx * dx + dz * dz;
+                if (dsq < bestSq) { bestSq = dsq; nearest = t; }
             }
             if (nearest != null) {
+                double best = Math.sqrt(bestSq) / dimScale;
                 lines.add("§f最近: " + nearest.name() + " §7(" + (int) Math.round(best) + "m)");
             }
         }
@@ -2055,6 +2203,31 @@ public class TownyMapMod implements ClientModInitializer {
         return only;
     }
 
+    private static volatile String loggedUnmappedWorld = null;
+
+    /**
+     * Whether {@link #playerMapWorld()} recognised the player's own dimension or had to fall back.
+     *
+     * <p>The difference decides whether we are entitled to move Xaero's map off the dimension the
+     * player is in. An exact world name, or either of EarthMC's two lunar dimensions (which share one
+     * published world), is a real answer. Everything else is a guess, and two of them are bad:
+     * {@code minecraft_*} collapses to the overworld, which is meant for the Nether and the End but
+     * also catches every extra world a Bukkit server adds -- they are all {@code minecraft:<name>};
+     * and the single-non-Earth-candidate branch picks the only other published world on no evidence.
+     *
+     * <p>Guessing a world to DRAW is fine, and deliberate -- it is the best available guess and the
+     * overlay can be hidden or rescaled. Guessing a world to move Xaero's terrain to is not: it
+     * replaces imagery the player has built up with a dimension they may never have visited. So when
+     * the answer is a guess, Xaero keeps following the player, and its own dimension button -- and the
+     * Earth/Moon pin in our settings -- are left to say otherwise.
+     */
+    private static boolean playerWorldWasGuessed() {
+        String raw = rawWorldKey();
+        if (raw == null) return true;
+        if (squaremapWorlds().containsKey(raw)) return false;   // a published world, by name
+        return !raw.startsWith("earthmc_");                     // moon + space -> the one lunar world
+    }
+
     /** The squaremap world the map should currently show. */
     public static String activeWorldKey() {
         if (config == null) return WORLD_OVERWORLD;
@@ -2164,12 +2337,30 @@ public class TownyMapMod implements ClientModInitializer {
     private static volatile boolean loggedXaeroNotReady = false;
 
     private static volatile long lastWorldMapInjectMs = 0;
+    private static volatile long lastWorldMapSurfaceMs = 0;
     private static volatile boolean warnedInjectsDead = false;
+    private static volatile boolean warnedSurfaceDead = false;
     private static volatile long mapOpenSinceMs = 0;
 
     /** Called from each GuiMap inject, so we can tell whether they are actually running. */
     public static void noteWorldMapInjectAlive() {
         lastWorldMapInjectMs = System.currentTimeMillis();
+    }
+
+    /**
+     * Called from the inject that draws the map surface -- the squaremap layer and the town claims.
+     *
+     * <p>Reported separately because it is the fragile one. The other two anchor on a method name;
+     * this one anchors on a field read inside extractRenderState, and that kind of anchor has stopped
+     * matching across a Xaero update before. Against a single shared timestamp the two robust injects
+     * kept refreshing it on this one's behalf, so the "hooks did not take" warning could never fire
+     * for the only inject at real risk of failing: the world map lost its imagery and its claims and
+     * still reported itself perfectly healthy.
+     */
+    public static void noteWorldMapSurfaceAlive() {
+        long now = System.currentTimeMillis();
+        lastWorldMapInjectMs = now;
+        lastWorldMapSurfaceMs = now;
     }
 
     /**
@@ -2179,24 +2370,55 @@ public class TownyMapMod implements ClientModInitializer {
      * also means it fails in complete silence, and the mod looks broken with no way to tell why. Three
      * separate reports this month were some version of that. If the map screen is up and neither inject
      * has fired for two seconds, the hooks did not take.
+     *
+     * <p>Checked at two levels, because losing all of them and losing only the surface one look nothing
+     * alike from the outside. With every inject dead the mod is plainly absent. With just the surface
+     * one dead the toggles still draw, still respond and still read ON, while the layer they switch is
+     * simply never painted -- so the one failure most likely to happen was also the one that looked
+     * least like a failure.
      */
     private static void tickWorldMapInjectHealth() {
-        if (warnedInjectsDead) return;
-        if (!isWorldMapScreenActive()) { mapOpenSinceMs = 0; return; }
+        if (warnedInjectsDead && warnedSurfaceDead) return;
+        // isWorldMapOpen(), not isWorldMapScreenActive(): the latter counts Xaero's settings and
+        // waypoint dialogs as the map, and only GuiMap runs our injects. Sitting in Xaero's own
+        // world-map options for two seconds used to be enough to be told Xaero was incompatible.
+        if (!isWorldMapOpen()) { mapOpenSinceMs = 0; return; }
         long now = System.currentTimeMillis();
         if (mapOpenSinceMs == 0) mapOpenSinceMs = now;
         // Give the screen two seconds to draw a frame before judging it.
         if (now - mapOpenSinceMs < 2000L) return;
-        if (lastWorldMapInjectMs != 0 && now - lastWorldMapInjectMs < 2000L) return;
-        warnedInjectsDead = true;
-        String ver = net.fabricmc.loader.api.FabricLoader.getInstance()
+
+        boolean anyAlive = lastWorldMapInjectMs != 0 && now - lastWorldMapInjectMs < 2000L;
+        boolean surfaceAlive = lastWorldMapSurfaceMs != 0 && now - lastWorldMapSurfaceMs < 2000L;
+
+        if (!anyAlive) {
+            if (warnedInjectsDead) return;
+            warnedInjectsDead = true;
+            String ver = xaeroWorldMapVersion();
+            LOGGER.warn("[TownyMap] Our world map hooks are not running - Xaero's World Map {} is not "
+                    + "compatible with this build. Update Xaero's World Map.", ver);
+            sendFeedback("无法挂钩 Xaero 世界地图 (" + ver + ")。请更新它，或报告此问题。",
+                    Formatting.RED);
+            return;
+        }
+
+        if (!surfaceAlive && !warnedSurfaceDead) {
+            warnedSurfaceDead = true;
+            String ver = xaeroWorldMapVersion();
+            LOGGER.warn("[TownyMap] Our world-map surface hook is not running - Xaero's World Map {} "
+                    + "has moved the anchor it attaches to. The squaremap layer and the town claims "
+                    + "will not draw on the world map; the minimap is unaffected. Update Xaero's "
+                    + "World Map.", ver);
+            sendFeedback("无法在 Xaero 世界地图上绘制（" + ver + "）：没有地图影像或领地。"
+                    + "请更新 Xaero 世界地图，或报告此问题。", Formatting.RED);
+        }
+    }
+
+    private static String xaeroWorldMapVersion() {
+        return net.fabricmc.loader.api.FabricLoader.getInstance()
                 .getModContainer("xaeroworldmap")
                 .map(m -> m.getMetadata().getVersion().getFriendlyString())
                 .orElse("未安装");
-        LOGGER.warn("[TownyMap] Our world map hooks are not running - Xaero's World Map {} is not "
-                + "compatible with this build. Update Xaero's World Map.", ver);
-        sendFeedback("无法挂钩 Xaero 世界地图 (" + ver + ")。请更新它，或报告此问题。",
-                Formatting.RED);
     }
 
     private static String warnedGateAddress = null;
@@ -2287,16 +2509,25 @@ public class TownyMapMod implements ClientModInitializer {
      * is up", and treating a hop into settings as a close would release and re-apply the dimension
      * override, each of which pauses Xaero's writer and moves a FileLock.
      */
+    /** Any of Xaero's world-map screens, the map itself or one of its settings/waypoint dialogs. */
     private static boolean isWorldMapScreenActive() {
         MinecraftClient client = MinecraftClient.getInstance();
         return client != null && client.currentScreen != null
                 && client.currentScreen.getClass().getName().startsWith("xaero.map.gui.");
     }
 
+
     private static volatile long worldMapClosedSinceMs = 0;
 
     private static void tickWorldMapOpenState() {
-        boolean open = isWorldMapScreenActive();
+        // Not just "is the map up" but "is the map up and is this a server we do anything on". With
+        // "EarthMC Only" left at its default, nothing of ours is drawn on another server -- but the
+        // dimension override was never gated on that, so opening the world map anywhere still yanked
+        // Xaero onto whatever world activeWorldKey() had resolved. On a Bukkit server with more than
+        // one world that is minecraft_overworld (see playerWorldWasGuessed), which on a build server
+        // is typically the hub: Xaero had mapped the world the player was actually in, and we pointed
+        // it at an empty one. A black map, from a mod that was supposed to be idle.
+        boolean open = isWorldMapScreenActive() && isActiveOnCurrentServer();
         if (open) {
             worldMapClosedSinceMs = 0;
             if (!worldMapWasOpen) {
@@ -2357,6 +2588,18 @@ public class TownyMapMod implements ClientModInitializer {
 
     /** @return true once Xaero has actually been pointed at a dimension; false to retry later. */
     private static boolean syncXaeroDimension() {
+        // Checked here as well as in tickWorldMapOpenState, because onActiveWorldChanged can request a
+        // sync too and only knows whether the map is on screen. true = stop retrying, not "done".
+        if (!isActiveOnCurrentServer()) return true;
+        if (config != null && config.mapWorldMode == WORLD_MODE_AUTO && playerWorldWasGuessed()) {
+            String raw = rawWorldKey();
+            if (raw != null && !raw.equals(loggedUnmappedWorld)) {
+                loggedUnmappedWorld = raw;
+                LOGGER.info("[TownyMap] {} is not a world the map publishes; leaving Xaero's map on the "
+                        + "dimension you are standing in", raw);
+            }
+            return true;
+        }
         try {
             var session = xaero.map.core.XaeroWorldMapCore.currentSession;
             var proc = session == null ? null : session.getMapProcessor();
@@ -2963,7 +3206,6 @@ public class TownyMapMod implements ClientModInitializer {
         if (!isActiveOnCurrentServer()) return;
         TownPopupData data = TownInfoOverlay.currentData();
         if (data != null && data != TownPopupData.WILDERNESS) {
-            requestTownActiveResidents(data.townName(), townKey(data.townName()));
             if (data.nationName() != null && !data.nationName().isBlank()) {
                 requestNationDetails(data.nationName());
             }
@@ -2981,14 +3223,19 @@ public class TownyMapMod implements ClientModInitializer {
             if (town == null) return;
 
             String key = townKey(town.name());
+            // No fetch from here. This card shows a town's mayor, nation and claim size, and the map
+            // carries all three already -- the first two off the marker's popup and tooltip, the third
+            // off the borders being drawn. A cached detail is still preferred when one exists, since
+            // the API's own chunk count is authoritative, but hovering a town is no longer a reason to
+            // spend a request on it.
             TownPopupData details = townDetailsCache.get(key);
-            requestTownDetails(town.name(), key);
             // In archive mode the live markers' mayor/nation are today's, not that date's — pass null so the
             // hover uses only the archived popup detail (which carries the historical mayor/nation).
             boolean arch = isArchiveMode();
             TownHoverOverlay.render(ctx, mouseX, mouseY, screenW, screenH, town, details,
                     arch ? null : apiClient.getTownMayor(key),
-                    arch ? archiveNationLabel(town, details) : apiClient.getTownNation(key));
+                    arch ? archiveNationLabel(town, details) : apiClient.getTownNationLabel(key),
+                    arch ? -1 : apiClient.getTownChunks(key));
         }
     }
 
@@ -3038,6 +3285,12 @@ public class TownyMapMod implements ClientModInitializer {
         return TownSearchOverlay.keyPressed(keyCode, apiClient.getTowns(), apiClient.getPlayers(),
                 townDetailsCache, apiPlayers, playerDetailsCache, apiClient.getPlayerHistory(),
                 activeNationList(), activeNationDetails());
+    }
+
+    /** Wheel over the search bar's hint/history stack. False leaves the event to Xaero, which zooms. */
+    public static boolean onTownSearchScroll(double mouseX, double mouseY, double amount, int screenW) {
+        if (!isActiveOnCurrentServer()) return false;
+        return TownSearchOverlay.mouseScrolled(mouseX, mouseY, amount, screenW);
     }
 
     public static boolean onTownSearchCharTyped(char chr) {
@@ -3145,8 +3398,18 @@ public class TownyMapMod implements ClientModInitializer {
         if (earthMcApi == null) return;
 
         java.util.concurrent.CompletableFuture<net.townymap.gui.DetailScreen.Page> future = switch (kind) {
+            // The same fallback the popup has had since the keyed API started refusing unkeyed
+            // requests. Without it the expanded panel was the one place in the addon that still
+            // treated "no key" as "no such town" -- right-click showed the card, Expand showed
+            // "Nothing found", for the same town in the same second. Costs nothing when the keyed
+            // request succeeds, and nothing extra when there is no key, because apiAllowed() turns
+            // that request back before a socket is opened.
             case TOWN -> earthMcApi.fetchTownFull(name)
-                    .thenApply(d -> d == null ? null : net.townymap.gui.DetailPages.town(d));
+                    .thenApply(d -> d == null ? null : net.townymap.gui.DetailPages.town(d))
+                    .thenCompose(page -> page != null
+                            ? java.util.concurrent.CompletableFuture.completedFuture(page)
+                            : earthMcApi.fetchMapTown(name).thenApply(
+                                    m -> m == null ? null : net.townymap.gui.DetailPages.town(m)));
             case PLAYER -> earthMcApi.fetchPlayerFull(name)
                     .thenApply(d -> d == null ? null : net.townymap.gui.DetailPages.player(d));
             case NATION -> earthMcApi.fetchNationFull(name)
@@ -3161,9 +3424,16 @@ public class TownyMapMod implements ClientModInitializer {
         future.thenAccept(page -> client.execute(() -> {
             if (client.currentScreen != screen) return;   // navigated away while the fetch was in flight
             if (page == null) {
-                // API opt-outs never resolve. Town rosters have no opt-out, so show what they do carry
-                // rather than a bare "not found" -- same fallback the map popup uses.
-                net.townymap.gui.DetailScreen.Page fallback = rosterPlayerPage(kind, name);
+                // Two ways to get here: an API opt-out, which never resolves, and no key at all,
+                // where nothing /v4 serves resolves either. Both get whatever the map can answer
+                // with on its own rather than a bare "not found".
+                //
+                // On the client thread on purpose -- these read the live town list rather than the
+                // network, so they belong where every other reader of it runs.
+                net.townymap.gui.DetailScreen.Page fallback =
+                        kind == net.townymap.gui.DetailScreen.Kind.NATION
+                                ? net.townymap.gui.DetailPages.mapNation(name)
+                                : rosterPlayerPage(kind, name);
                 if (fallback != null) screen.setPage(fallback);
                 else screen.markFailed();
             } else {
@@ -3477,50 +3747,61 @@ public class TownyMapMod implements ClientModInitializer {
         return d + " " + (m >= 1 && m <= 12 ? mon[m] : "?") + " " + y;
     }
 
-    public static void onMapRightClick(double worldX, double worldZ, int screenX, int screenY) {
-        if (!isActiveOnCurrentServer()) return;
-        if (earthMcApi == null) return;
+    /**
+     * Opens the town popup for a right-click on the map, and reports whether the click was ours.
+     *
+     * <p>False means we did nothing with it and the caller must leave it unconsumed, because Xaero's
+     * own right-click menu — add waypoint here, teleport, share location — is the only thing a
+     * right-click on unclaimed ground can usefully do, and that menu never opens if GuiMap.mouseClicked
+     * is cancelled out from under it. Claimed ground is ours; everything else is Xaero's. The test is
+     * the one the hover tooltip already uses, so the rule reads off the screen: right-click where a
+     * town name appears and you get the town, right-click bare map and you get Xaero's menu.
+     */
+    public static boolean onMapRightClick(double worldX, double worldZ, int screenX, int screenY) {
+        if (!isActiveOnCurrentServer()) return false;
+        if (earthMcApi == null) return false;
+        TownData clickedTown = apiClient == null ? null
+                : TownHoverOverlay.townAt(worldX, worldZ, apiClient.getTowns());
+        // Unclaimed ground goes to Xaero unless the player has asked for the old behaviour back.
+        if (clickedTown == null && (config == null || !config.wildernessTownInfo)) return false;
         armedMapDismiss = false;
         TownSearchOverlay.reset();   // right-clicking a new town clears any active search bar/result
-        TownData clickedTown = null;
-        TownPopupData fallback = null;
-        MapJumpTarget fallbackTarget = null;
-        String fallbackKey = "";
-        if (apiClient != null) {
-            TownData town = TownHoverOverlay.townAt(worldX, worldZ, apiClient.getTowns());
-            if (town != null) {
-                clickedTown = town;
-                fallbackKey = townKey(town.name());
-                fallback = townDetailsCache.get(fallbackKey);
-                fallbackTarget = new MapJumpTarget(town.name(), town.centerX(), town.centerZ());
-            }
-        }
+        String fallbackKey = clickedTown == null ? "" : townKey(clickedTown.name());
+        TownPopupData cached = clickedTown == null ? null : townDetailsCache.get(fallbackKey);
+        // The map can always build a card for a claimed town. Whether to SHOW it before the API has
+        // answered is the question. With no usable key the API will not be asked at all, so without
+        // it the panel would never open; with one, the real record is a few hundred milliseconds
+        // away, and flashing a shorter card first makes the panel visibly change shape under the
+        // reader -- rows filling in, PVP turning into Open, the resident count jumping from the roll
+        // to the active figure. So it is held back as the fallback for a request that FAILS, and the
+        // ordinary loading state covers the wait.
+        // The keyless exception here is gone too. It existed because without a key nothing better was
+        // ever coming, so a guess beat an empty panel; /map/v1 answers without one, so every reader now
+        // has a real card arriving and none of them should watch a shorter one reshape first.
+        TownPopupData mapCard = (clickedTown != null && !isArchiveMode()) ? mapOnlyTownData(clickedTown) : null;
+        TownPopupData fallback = cached;
+        MapJumpTarget fallbackTarget = clickedTown == null ? null
+                : new MapJumpTarget(clickedTown.name(), clickedTown.centerX(), clickedTown.centerZ());
         long lookupId = townLookupId.incrementAndGet();
         if (fallback != null) {
             showLookupResult(fallback, screenX, screenY, worldX, worldZ, fallbackTarget);
             // Archive: the live API doesn't know these historical towns — keep the snapshot popup, never fetch.
-            if (isArchiveMode() || isTownDetailsFresh(fallbackKey)) return;
+            if (isArchiveMode()) return true;
         } else if (isArchiveMode()) {
             TownInfoOverlay.dismiss();   // archived town with no seeded detail — nothing live to fall back to
-            return;
+            return true;
         } else {
             TownInfoOverlay.showLoading(screenX, screenY);
         }
-        TownPopupData cachedFallback = fallback;
+        // A failed request still ends with something on screen rather than nothing: the cached record
+        // if there is one, otherwise the card the map can build.
+        TownPopupData cachedFallback = cached != null ? cached : mapCard;
         MapJumpTarget cachedFallbackTarget = fallbackTarget;
-        if (clickedTown != null) {
-            earthMcApi.fetchTown(clickedTown.name()).thenAccept(data -> {
-                MinecraftClient client = MinecraftClient.getInstance();
-                if (client == null) return;
-                client.execute(() -> {
-                    if (lookupId != townLookupId.get()) return;
-                    showLookupResult(data != null ? data : cachedFallback, screenX, screenY,
-                            worldX, worldZ, cachedFallbackTarget);
-                });
-            });
-            return;
-        }
-        earthMcApi.fetchTownAt(worldX, worldZ).thenAccept(data -> {
+        // By name when the claim is ours to name, by position otherwise -- the second only happens with
+        // wildernessTownInfo on, and is what answers "is this really unclaimed?" rather than assuming it.
+        fetchTownCard(clickedTown != null ? earthMcApi.fetchTown(clickedTown.name())
+                                          : earthMcApi.fetchTownAt(worldX, worldZ),
+                      clickedTown != null ? clickedTown.name() : null).thenAccept(data -> {
             MinecraftClient client = MinecraftClient.getInstance();
             if (client == null) return;
             client.execute(() -> {
@@ -3529,6 +3810,7 @@ public class TownyMapMod implements ClientModInitializer {
                         worldX, worldZ, cachedFallbackTarget);
             });
         });
+        return true;
     }
 
     /**
@@ -3564,7 +3846,7 @@ public class TownyMapMod implements ClientModInitializer {
         long lookupId = townLookupId.incrementAndGet();
         if (fallback != null) {
             showLookupResult(fallback, sx, sy, worldX, worldZ, fallbackTarget);
-            if (isArchiveMode() || isTownDetailsFresh(fallbackKey)) return;   // archive: keep the snapshot popup
+            if (isArchiveMode()) return;   // archive: keep the snapshot popup
         } else if (isArchiveMode()) {
             TownInfoOverlay.dismiss();
             return;
@@ -3574,7 +3856,7 @@ public class TownyMapMod implements ClientModInitializer {
         final TownPopupData cachedFallback = fallback;
         final MapJumpTarget cachedFallbackTarget = fallbackTarget;
         final double fWorldX = worldX, fWorldZ = worldZ;
-        earthMcApi.fetchTown(townName).thenAccept(data -> {
+        fetchTownCard(earthMcApi.fetchTown(townName), townName).thenAccept(data -> {
             MinecraftClient c = MinecraftClient.getInstance();
             if (c == null) return;
             c.execute(() -> {
@@ -3600,6 +3882,16 @@ public class TownyMapMod implements ClientModInitializer {
     private static volatile boolean blockedNoticeShown = false;
 
     /**
+     * How often the access check may re-run. Every caller of {@link #isAccessBlocked()} is a render
+     * path -- the minimap draws through it on every frame -- while its inputs are your uuid, fixed for
+     * the session, and your nation, which arrives once. Re-running it per frame bought nothing and put
+     * the whole check, {@link #selfPlayer()} included, on the frame budget. Twice a second still picks
+     * the nation up as soon as the record lands.
+     */
+    private static final long ACCESS_EVAL_INTERVAL_MS = 2000L;
+    private static volatile long accessEvaluatedAt = 0L;
+
+    /**
      * Whether this player is barred from the mod's features.
      *
      * <p>Fetched once per launch and matched on UUID, or on the player's nation. Fails open at every
@@ -3615,7 +3907,15 @@ public class TownyMapMod implements ClientModInitializer {
                 evaluateAccess();
             });
         }
-        if (!blocklist.isEmpty() && !accessBlocked) evaluateAccess();
+        // A uuid match is settled by the first evaluation; a nation match needs your own record, which
+        // is fetched asynchronously, so this has to keep looking -- just not on every frame.
+        if (!blocklist.isEmpty() && !accessBlocked) {
+            long now = System.currentTimeMillis();
+            if (now - accessEvaluatedAt >= ACCESS_EVAL_INTERVAL_MS) {
+                accessEvaluatedAt = now;
+                evaluateAccess();
+            }
+        }
         return accessBlocked;
     }
 
@@ -3666,12 +3966,80 @@ public class TownyMapMod implements ClientModInitializer {
      * it to go. Called every tick; cheap, and does nothing unless the player is actually blocked.
      */
     public static void tickAccessNotice() {
-        if (blockedNoticeShown || !isAccessBlocked()) return;
+        if (blockedNoticeShown || !isAccessBlocked()) {
+            tickApiKeyNotice();
+            return;
+        }
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc == null || mc.world == null) return;           // wait until a world is loaded
-        if (mc.currentScreen instanceof net.townymap.gui.BlockedScreen) return;
+        if (mc.currentScreen != null) return;                // still joining, or busy elsewhere
         blockedNoticeShown = true;
-        mc.setScreen(new net.townymap.gui.BlockedScreen(mc.currentScreen, blocklist.message()));
+        mc.setScreen(new net.townymap.gui.BlockedScreen(null, blocklist.message()));
+    }
+
+    /** Posts per launch, so a client that keeps clearing screens cannot turn a retry into a flicker. */
+    private static final int MAX_API_KEY_NOTICE_POSTS = 3;
+    private static int apiKeyNoticePosts = 0;
+
+    /**
+     * Puts the "you can add an API key" notice up once -- once it has actually been read, not once it
+     * has been posted.
+     *
+     * <p>Only on EarthMC, and only with no key set: there is nothing to say to someone who already
+     * has one, and nothing the key would do on another server. A player who already has a key is
+     * marked as having seen it and shown nothing, so clearing a key later does not summon a notice
+     * they never needed.
+     *
+     * <p>Waits for no screen at all, rather than for a world to exist. A world exists for seconds
+     * before a join settles, with the terrain screen still up and about to be cleared -- and the
+     * clear takes our notice with it, leaving the player a single frame if that. That is the trap
+     * recorded in {@link #refreshAccess}, and this method sat in it: the flag was written as the
+     * screen went up, so one lost frame spent the only showing there would ever be. Hence both
+     * halves of the fix -- post only into an idle client, and let {@link #markApiKeyNoticeSeen()}
+     * write the flag when the player dismisses the screen, which is the first moment we know it was
+     * on screen long enough to read.
+     *
+     * <p>Rides on the same tick as the blocked notice, and defers to it: being told your access is
+     * gone and being told about an optional key in the same breath would be a poor pair.
+     */
+    private static void tickApiKeyNotice() {
+        if (config == null || config.apiKeyNoticeShown) return;
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc == null || mc.world == null) return;           // wait until a world is loaded
+        if (!isOnEarthMcServer()) return;                     // pointless anywhere else
+        // Someone who already pasted a key needs no instructions -- mark it seen and stay quiet.
+        if (!config.earthMcApiKey.isBlank()) { markApiKeyNoticeSeen(); return; }
+        if (mc.currentScreen != null) return;                // still joining, or busy elsewhere
+        if (apiKeyNoticePosts >= MAX_API_KEY_NOTICE_POSTS) return;
+        apiKeyNoticePosts++;
+        mc.setScreen(new net.townymap.gui.ApiKeyNoticeScreen(null));
+    }
+
+    /**
+     * Records that the notice has been read, which only the screen can say.
+     *
+     * <p>Called when the player dismisses it, by either button or Esc. Until then the notice is
+     * still owed, and a launch that loses it to a screen clear shows it again next time instead of
+     * counting it as read.
+     */
+    public static void markApiKeyNoticeSeen() {
+        if (config == null || config.apiKeyNoticeShown) return;
+        config.apiKeyNoticeShown = true;
+        config.save();
+    }
+
+    /**
+     * Opens the notice on demand, from settings.
+     *
+     * <p>Ignores both the flag and the key, unlike the automatic path: someone who asks for it wants
+     * to see it, whatever it decided on their behalf at launch. Without this the panel was reachable
+     * exactly once per install and unreachable afterwards -- by anyone, including whoever had just
+     * closed it by accident.
+     */
+    public static void showApiKeyNotice(net.minecraft.client.gui.screen.Screen parent) {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc == null) return;
+        mc.setScreen(new net.townymap.gui.ApiKeyNoticeScreen(parent));
     }
 
     public static boolean isActiveOnCurrentServer() {
@@ -3714,9 +4082,13 @@ public class TownyMapMod implements ClientModInitializer {
                                          double clickedWorldX, double clickedWorldZ,
                                          MapJumpTarget fallbackTarget) {
         if (data != null) {
+            // Fold in the map's resident total before anything reads this. cacheTownDetails does the
+            // same to the cached copy, and the panel must not end up showing a different number from
+            // the one the search rows show for the same town.
+            if (data != TownPopupData.WILDERNESS) data = withMapTotals(townKey(data.townName()), data);
             // Don't persist archived popups into the live (disk-backed) details cache — that would leak
             // historical data into the live map on the next session.
-            if (data != TownPopupData.WILDERNESS && !isArchiveMode()) {
+            if (data != TownPopupData.WILDERNESS && !isArchiveMode() && !data.mapOnly()) {
                 cacheTownDetails(townKey(data.townName()), data);
                 scheduleTownDetailsCacheSave();
             }
@@ -3774,32 +4146,133 @@ public class TownyMapMod implements ClientModInitializer {
         }
     }
 
+    /** Where the API key stands, for the settings screen. Never exposes the key itself. */
+    public static net.townymap.api.ApiKeyState apiKeyState() {
+        return earthMcApi == null ? net.townymap.api.ApiKeyState.MISSING : earthMcApi.keyState();
+    }
+
+    /**
+     * Re-applies the configured API key and re-tests it. Called when the key is edited in settings, so
+     * a correction takes effect at once rather than at the next restart. The key itself never appears
+     * in a log line or a chat message -- only whether EarthMC accepted it.
+     */
+    public static void applyApiKey() {
+        if (earthMcApi == null || config == null) return;
+        earthMcApi.setApiKey(config.earthMcApiKey);
+        if (!earthMcApi.hasApiKey()) {
+            sendFeedback("API 密钥已清除。EarthMC 查询已关闭；地图功能仍可用。",
+                    Formatting.YELLOW);
+            return;
+        }
+        earthMcApi.verifyKey().thenAccept(state -> {
+            MinecraftClient c = MinecraftClient.getInstance();
+            if (c == null) return;
+            c.execute(() -> {
+                if (state == net.townymap.api.ApiKeyState.OK) {
+                    clearApiBackoffs();
+                    sendFeedback("API 密钥已通过验证。", Formatting.GREEN);
+                } else if (state == net.townymap.api.ApiKeyState.REJECTED) {
+                    // The length, never the key. A paste that arrived cut short refuses exactly like a
+                    // wrong key, and this one number tells the two apart without guesswork.
+                    sendFeedback("EarthMC 拒绝了该 API 密钥（发送了 " + earthMcApi.apiKeyLength()
+                                    + " 个字符）。请检查是否完整粘贴，或运行 /api key copy"
+                                    + " 获取当前密钥。",
+                            Formatting.RED);
+                } else {
+                    sendFeedback("无法连接 EarthMC 验证密钥；仍会使用该密钥。",
+                            Formatting.YELLOW);
+                }
+            });
+        });
+    }
+
+    /**
+     * Forgets every "we already tried that and it failed" marker.
+     *
+     * <p>While there is no usable key, requests do not merely fail -- they fail INSTANTLY, and each
+     * failure arms a backoff meant for a flaky network: five to thirty minutes for a player, ten for
+     * the alliance data, and a permanent session-long entry for a nation's bonus projection or a
+     * town's overclaim date, neither of which has any expiry at all. Pasting a working key would
+     * otherwise fix nothing visible for half an hour, because every path was still serving a refusal
+     * it had recorded while there was no key to use.
+     *
+     * <p>Clearing the two index timestamps as well makes the first map frame after this re-request
+     * them, which is what puts the nation capital stars back.
+     */
+    private static void clearApiBackoffs() {
+        townDetailsDeferredAt.clear();
+        playerDetailsFailedAt.clear();
+        playerDetailsDeferredAt.clear();
+        nationDetailsDeferredAt.clear();
+        // These two cache the FAILURE as a result and never expire on their own.
+        nationBonusProjCache.clear();
+        townOverclaimCache.clear();
+        lastPlayerIndexAttemptMs = 0L;
+        lastNationIndexAttemptMs = 0L;
+        lastNationCapitalDetailsRequestMs = 0L;
+        // Let the alliance source be tried again at once rather than at the end of its doubling wait.
+        allianceLoadedMs = 0L;
+        allianceRetryMs = ALLIANCE_RETRY_MIN_MS;
+    }
+
+    /**
+     * Tells the player the window is open, since settings closes to let them type the command.
+     *
+     * <p>Takes the command rather than naming one, because which is right depends on whether they
+     * already have a key: {@code create} mints the first, {@code copy} hands back one that exists.
+     */
+    public static void announceKeyCaptureArmed(String command) {
+        sendFeedback("正在读取聊天 " + (net.townymap.api.ApiKeyCapture.WINDOW_MS / 1000)
+                + " 秒。运行 " + command + "，你的密钥将自动保存。",
+                Formatting.YELLOW);
+    }
+
+    /**
+     * Offers {@code create} once a {@code copy} has come back empty.
+     *
+     * <p>The command is suggested, not run: clicking fills the chat box and leaves Enter to the
+     * player, because minting a key acts on their account and that is theirs to trigger.
+     */
+    private static void tickApiKeyCapture() {
+        if (!net.townymap.api.ApiKeyCapture.copyWentUnanswered()) return;
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.player == null) return;
+        client.player.sendMessage(Text.literal("[TownyMap] ")
+                .formatted(Formatting.GOLD)
+                .append(Text.literal("EarthMC 还没有返回任何内容。如果你还没有密钥，"
+                                + "这是创建密钥的命令：")
+                        .formatted(Formatting.YELLOW))
+                .append(Text.literal("[点击运行 /api key create]")
+                        .styled(st -> st.withColor(Formatting.AQUA)
+                                .withUnderline(true)
+                                .withClickEvent(new net.minecraft.text.ClickEvent
+                                        .SuggestCommand("/api key create")))), false);
+    }
+
+    /**
+     * Stores a key read out of chat and asks EarthMC to confirm it.
+     *
+     * <p>The key itself is never logged or echoed back -- only its length, which is the one detail
+     * that separates a wrong key from one that arrived cut short.
+     */
+    private static void acceptCapturedApiKey(String key) {
+        net.townymap.api.ApiKeyCapture.cancel();
+        if (config == null) return;
+        String normalized = TownyMapConfig.normalizeApiKey(key);
+        if (normalized.isEmpty()) return;
+        config.earthMcApiKey = normalized;
+        config.save();
+        applyApiKey();
+        sendFeedback("已从聊天中获取你的 API 密钥（" + normalized.length()
+                + " 个字符）并保存。正在向 EarthMC 验证。", Formatting.GREEN);
+    }
+
     private static void sendFeedback(String message, Formatting color) {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client == null || client.player == null) return;
         client.player.sendMessage(Text.literal("[TownyMap] ")
                 .formatted(Formatting.GOLD)
                 .append(Text.literal(message).formatted(color)), false);
-    }
-
-    // Single-town fetch for the hovered/clicked town. Visible-map and search details go through the bulk
-    // path (requestTownDetailsBulk); this is only ever called for one town at a time, so it needs no
-    // concurrency cap of its own — the loading set just dedupes an in-flight request.
-    private static void requestTownDetails(String townName, String key) {
-        if (isArchiveMode()) return;   // archive uses the snapshot's own popup data, never live
-        long now = System.currentTimeMillis();
-        if (earthMcApi == null || isTownDetailsFresh(key) || requestDeferred(townDetailsDeferredAt, key, now)) return;
-        if (!townDetailsLoading.add(key)) return;
-        earthMcApi.fetchTown(townName).whenComplete((data, error) -> {
-            if (data != null && data != TownPopupData.WILDERNESS) {
-                cacheTownDetails(key, data);
-                scheduleTownDetailsCacheSave();
-                townDetailsDeferredAt.remove(key);
-            } else if (error != null) {
-                deferRequest(townDetailsDeferredAt, key, System.currentTimeMillis());
-            }
-            townDetailsLoading.remove(key);
-        });
     }
 
     private static boolean requestDeferred(Map<String, Long> deferredAt, String key, long now) {
@@ -3817,54 +4290,111 @@ public class TownyMapMod implements ClientModInitializer {
         deferredAt.put(key, now);
     }
 
-    private static boolean isTownDetailsFresh(String key) {
-        if (!townDetailsCache.containsKey(key)) return false;
-        Long fetchedAt = townDetailsFetchedAt.get(key);
-        return fetchedAt != null && System.currentTimeMillis() - fetchedAt < TOWN_DETAILS_MAX_AGE_MS;
-    }
-
     private static void cacheTownDetails(String requestedKey, TownPopupData data) {
         if (data == null || data == TownPopupData.WILDERNESS) return;
-        long now = System.currentTimeMillis();
+        // A map-built card is a placeholder shown while the API is asked, not an answer. Caching one
+        // puts it straight back on screen as the instant fallback the next time this town is opened,
+        // and writes it to the on-disk cache to be read back next session as though EarthMC had
+        // returned it.
+        if (data.mapOnly()) return;
         String canonicalKey = townKey(data.townName());
         if (requestedKey != null && !requestedKey.isBlank()) {
-            townDetailsCache.put(requestedKey, withCachedActive(requestedKey, data));
-            townDetailsFetchedAt.put(requestedKey, now);
+            townDetailsCache.put(requestedKey, withMapTotals(requestedKey, data));
             townDetailsDeferredAt.remove(requestedKey);
         }
-        townDetailsCache.put(canonicalKey, withCachedActive(canonicalKey, data));
-        townDetailsFetchedAt.put(canonicalKey, now);
+        townDetailsCache.put(canonicalKey, withMapTotals(canonicalKey, data));
         townDetailsDeferredAt.remove(canonicalKey);
     }
 
-    /** Re-applies a previously looked-up active count when base town data is (re)cached, so the
-     *  inactive suffix survives a base refresh and the active-before-base ordering both work. */
-    private static TownPopupData withCachedActive(String key, TownPopupData data) {
-        Integer a = townActiveCache.get(key);
-        return (a != null && a >= 0) ? data.withActiveResidentCount(a) : data;
+    /**
+     * Folds the figures the map carries for free into town data the API returned.
+     *
+     * <p>The API's resident count is the ACTIVE one: EarthMC filters both {@code stats.numResidents}
+     * and the roster to the last 42 days. The town's TOTAL is only on the squaremap popup, which still
+     * lists every member -- so without this the two numbers are identical and the "(N Inactive)"
+     * suffix can never appear. Never lowers the count: if the markers are stale or the town is missing
+     * from them, the API's figure stands.
+     */
+    /**
+     * Everything the live map knows about a town, as a card in its own right.
+     *
+     * <p>Used when the API cannot answer -- no key, a refused key, or a lookup that simply failed.
+     * The map carries the town's name, nation, mayor, founding date, PVP and Public flags, its full
+     * resident roll and, from the borders being drawn, its claim size. What it has no copy of is the
+     * balance, whether the town is open or for sale, and the claim maximum, so the card marks itself
+     * {@code mapOnly} and the overlay omits those rows rather than printing a default as though it
+     * were a fact.
+     */
+    private static TownPopupData mapOnlyTownData(TownData town) {
+        if (apiClient == null || town == null) return null;
+        String key = townKey(town.name());
+        String nation = apiClient.getTownNation(key);
+        net.townymap.api.SquaremapApiClient.MapTownFacts f = apiClient.getTownFacts(key);
+        String mayor = apiClient.getTownMayor(key);
+        int residents = Math.max(0, apiClient.getTownResidents(key));
+        int chunks = apiClient.getTownChunks(key);
+        if (chunks <= 0) chunks = town.approximateChunks();
+        boolean hasNation = nation != null && !nation.isBlank();
+        return new TownPopupData(
+                town.name(), hasNation ? nation : "", "", f == null ? "" : f.board(),
+                mayor == null || mayor.isBlank() ? "?" : mayor,
+                chunks, f == null ? "" : f.founded(), f != null && f.pvp(),
+                f != null && f.isPublic(),
+                false, false, false, false,            // API-only; mapOnly tells the card to skip them
+                hasNation, residents, 0, -1, -1, true, false);
     }
 
-    /** Looks up the active-resident count for ONE focused town (off the mass-fetch path) and folds
-     *  it into the cached detail + the open info panel. Cheap: at most one town's residents. */
-    /** Triggers the on-demand active-resident lookup for a focused town (search panel), so it's fetched
-     *  only for the town actually opened rather than every visible search row. */
-    public static void requestTownActive(String townName) {
-        requestTownActiveResidents(townName, townKey(townName));
-    }
-
-    private static void requestTownActiveResidents(String townName, String key) {
-        if (isArchiveMode()) return;
-        if (earthMcApi == null || townName == null || townName.isBlank() || key == null || key.isBlank()) return;
-        if (townActiveCache.containsKey(key) || !townActiveLoading.add(key)) return;
-        earthMcApi.fetchTownActiveResidents(townName).whenComplete((count, error) -> {
-            int c = count != null ? count : -1;
-            townActiveCache.put(key, c);   // cache even -1 so this doesn't re-fire every frame
-            if (c >= 0) {
-                townDetailsCache.computeIfPresent(key, (k, old) -> old.withActiveResidentCount(c));
-                TownInfoOverlay.setActiveResidentCount(townName, c);
+    /**
+     * A town card built from the keyless /map/v1 record.
+     *
+     * <p>Still {@code mapOnly}: open, for-sale, outsider spawn, overclaim, the claim limit and the
+     * active resident count exist only behind a key. Everything else on the card is now real --
+     * including the bank, which is why {@code balanceKnown} is set and the old squaremap-built
+     * placeholder's is not.
+     */
+    /**
+     * The town card, from one source rather than two.
+     *
+     * <p>Asking both every time was waste dressed up as thoroughness. /v4 already carries the exact
+     * claim count in {@code stats.numTownBlocks}, and the total resident roll already arrives free in
+     * the squaremap markers we fetch for the claims layer anyway -- so for a reader with a key the
+     * second request bought one number we already had, at 7.6 KB a town, most of it a resident list
+     * read only for its length.
+     *
+     * <p>So: try the keyed endpoint, and fall back to /map/v1 only when it yields nothing. With no key
+     * that fallback is the whole story and costs nothing extra, because {@code apiAllowed()} refuses
+     * the keyed request before a socket is opened -- it returns null without touching the network. With
+     * a key it is the recovery path for a lookup that failed, which is strictly more than the card had
+     * before. Either way, one request in the normal case.
+     */
+    private static java.util.concurrent.CompletableFuture<TownPopupData> fetchTownCard(
+            java.util.concurrent.CompletableFuture<TownPopupData> keyed, String townName) {
+        return keyed.thenCompose(data -> {
+            if (data != null || townName == null || townName.isBlank()) {
+                return java.util.concurrent.CompletableFuture.completedFuture(data);
             }
-            townActiveLoading.remove(key);
+            return earthMcApi.fetchMapTown(townName).thenApply(TownyMapMod::mapApiTownData);
         });
+    }
+
+    private static TownPopupData mapApiTownData(net.townymap.model.MapTownData m) {
+        if (m == null) return null;
+        boolean hasNation = m.nation() != null && !m.nation().isBlank();
+        return new TownPopupData(
+                m.name(), hasNation ? m.nation() : "", m.discord() == null ? "" : m.discord(),
+                m.board() == null ? "" : m.board(),
+                m.mayor() == null || m.mayor().isBlank() ? "?" : m.mayor(),
+                m.claims(), m.founded(), m.pvp(), m.isPublic(),
+                false, false, false, false,            // key-only; mapOnly tells the card to skip them
+                hasNation, m.residents(), m.balance(), -1, -1, true, true);
+    }
+
+    private static TownPopupData withMapTotals(String key, TownPopupData data) {
+        if (apiClient == null || data == null) return data;
+        // An archived popup is that date's; the live markers are today's, so leave it alone.
+        if (isArchiveMode()) return data;
+        int total = apiClient.getTownResidents(key);
+        return total > data.residentCount() ? data.withTotalResidentCount(total) : data;
     }
 
     /** Looks up the active-resident count for ONE focused nation (off the mass-fetch path). */
@@ -4318,6 +4848,14 @@ public class TownyMapMod implements ClientModInitializer {
     private static final long PLAYER_DETAIL_TTL_MS = 600_000L;   // 10 minutes
     private static final Map<String, Long> playerDetailsAt = new ConcurrentHashMap<>();
 
+    /**
+     * Above this many entries the cache is swept. Two keys are written per player, and a long session
+     * that browses the map touches a great many of EarthMC's forty-odd thousand accounts.
+     */
+    private static final int PLAYER_DETAIL_CACHE_MAX = 4_000;
+    private static final long PLAYER_DETAIL_SWEEP_MS = 60_000L;
+    private static volatile long lastPlayerDetailSweepMs = 0L;
+
     /** Records a fetched player under both keys, with the time, so the entry can go stale later. */
     private static void cachePlayerDetails(String key, EarthMcPlayerData data) {
         long now = System.currentTimeMillis();
@@ -4326,6 +4864,45 @@ public class TownyMapMod implements ClientModInitializer {
         String nameKey = townKey(data.name());
         playerDetailsCache.put(nameKey, data);
         playerDetailsAt.put(nameKey, now);
+        sweepPlayerDetailsIfLarge(now);
+    }
+
+    /**
+     * Drops cached players that are past their TTL, once the cache has grown large enough to be worth
+     * the walk.
+     *
+     * <p>Entries expired but were never removed: {@link #playerDetailNeeded} treats a stale one as
+     * missing and fetches it again, so it was only ever taking up room from then on. Nothing is lost
+     * by dropping them, and nothing still in date is touched.
+     *
+     * <p>Rate-limited separately from the size check, so a cache that is over the cap but entirely
+     * fresh does not walk itself on every single put.
+     */
+    private static void sweepPlayerDetailsIfLarge(long now) {
+        if (playerDetailsCache.size() <= PLAYER_DETAIL_CACHE_MAX) return;
+        if (now - lastPlayerDetailSweepMs < PLAYER_DETAIL_SWEEP_MS) return;
+        lastPlayerDetailSweepMs = now;
+        playerDetailsAt.entrySet().removeIf(e -> {
+            if (now - e.getValue() < PLAYER_DETAIL_TTL_MS) return false;
+            playerDetailsCache.remove(e.getKey());
+            return true;
+        });
+    }
+
+    /** Whether this nation's lookup has been tried and come back empty. The deferred stamp is set
+     *  when the API does not return a nation it was asked for, and cleared when one arrives, so its
+     *  presence means "asked, and got nothing". */
+    public static boolean nationLookupFailed(String name) {
+        if (name == null || name.isBlank()) return false;
+        return nationDetailsDeferredAt.containsKey(townKey(name));
+    }
+
+    /** Whether this player's lookup has been tried and come back empty -- an opt-out, usually, which
+     *  never resolves. Lets a card say "not on the API" only once that is actually true, rather than
+     *  while the first request is still in flight. */
+    public static boolean playerLookupFailed(String name) {
+        if (name == null || name.isBlank()) return false;
+        return playerDetailsFailedAt.containsKey(townKey(name));
     }
 
     private static boolean playerDetailNeeded(String key, long now) {
@@ -4561,6 +5138,50 @@ public class TownyMapMod implements ClientModInitializer {
         return config == null ? List.of() : List.copyOf(config.favoritePlayers);
     }
 
+    /** Bumped whenever the history changes, so the search bar can cache its rows and still react at once. */
+    private static volatile int searchHistoryVersion = 0;
+
+    public static int searchHistoryVersion() { return searchHistoryVersion; }
+
+    /** What you last opened from a search box, newest first, for the search bar's scrollable stack. */
+    public static List<TownyMapConfig.RecentSearch> recentSearches() {
+        return config == null || !config.recordSearchHistory
+                ? List.of() : List.copyOf(config.recentSearches);
+    }
+
+    /**
+     * Records something opened from a search box, newest first and deduped.
+     *
+     * <p>Only ever called from a search activation -- never from {@code openDetail} itself. Clicking a
+     * nation, then its capital, then the mayor, then their town is browsing, and recording the whole
+     * chain would bury the thing you actually looked up under four pages you merely passed through.
+     *
+     * <p>Writes the config, which rewrites the whole file, so this must stay on user actions and off
+     * any render path.
+     */
+    public static void rememberSearch(String type, String name) {
+        if (config == null || !config.recordSearchHistory) return;
+        if (name == null || name.isBlank() || type == null || type.isBlank()) return;
+        // An archive snapshot is full of towns that no longer exist; seeding the live jump list from one
+        // would leave rows that go nowhere the moment you come back to the present.
+        if (isArchiveMode()) return;
+        config.recentSearches.removeIf(r -> r != null && r.kind().equalsIgnoreCase(type)
+                && r.name().equalsIgnoreCase(name));
+        config.recentSearches.add(0, new TownyMapConfig.RecentSearch(type, name, System.currentTimeMillis()));
+        while (config.recentSearches.size() > TownyMapConfig.MAX_RECENT_SEARCHES) {
+            config.recentSearches.remove(config.recentSearches.size() - 1);
+        }
+        searchHistoryVersion++;
+        config.save();
+    }
+
+    public static void clearSearchHistory() {
+        if (config == null || config.recentSearches.isEmpty()) return;
+        config.recentSearches.clear();
+        searchHistoryVersion++;
+        config.save();
+    }
+
     private static void toggleFavorite(String townName) {
         if (config == null || townName == null || townName.isBlank()) return;
         String key = townKey(townName);
@@ -4586,6 +5207,7 @@ public class TownyMapMod implements ClientModInitializer {
 
     private static void loadTownDetailsCache() {
         Path path = townDetailsCachePath();
+        discardSupersededTownCache();
         if (!Files.isRegularFile(path)) return;
         try {
             String json = Files.readString(path);
@@ -4600,9 +5222,15 @@ public class TownyMapMod implements ClientModInitializer {
             }
             Map<String, TownPopupData> loaded = GSON.fromJson(json, TOWN_CACHE_TYPE);
             if (loaded != null) {
-                townDetailsCache.putAll(loaded);
-                for (String key : loaded.keySet()) {
-                    townDetailsFetchedAt.put(key, 0L);
+                int placeholders = 0;
+                for (Map.Entry<String, TownPopupData> e : loaded.entrySet()) {
+                    // Placeholders are not answers, and a build before this check could write them.
+                    if (e.getValue() == null || e.getValue().mapOnly()) { placeholders++; continue; }
+                    townDetailsCache.put(e.getKey(), e.getValue());
+                }
+                if (placeholders > 0) {
+                    LOGGER.info("[TownyMap] Dropped {} map-built placeholder(s) from the town cache",
+                            placeholders);
                 }
             }
         } catch (Exception e) {
@@ -4624,6 +5252,7 @@ public class TownyMapMod implements ClientModInitializer {
     private static void saveTownDetailsCacheNow() {
         Path path = townDetailsCachePath();
         try {
+            pruneTownDetailsCache();
             Files.createDirectories(path.getParent());
             Files.writeString(path, GSON.toJson(townDetailsCache));
         } catch (Exception e) {
@@ -4635,10 +5264,58 @@ public class TownyMapMod implements ClientModInitializer {
         }
     }
 
+    /**
+     * Drops cached details for towns that are no longer on the map.
+     *
+     * <p>The cache is written whole and read back whole at launch, and nothing ever removed an entry,
+     * so every town that has ever been looked at stayed in it for good -- and in the heap for the
+     * whole session. On this account it had grown to around seven thousand entries against fewer than
+     * six thousand live towns: one entry in six was for a town that had been deleted or renamed.
+     *
+     * <p>Only ever on save, and only when the live town list has actually loaded. An empty or partial
+     * list must not be read as "every town is gone", and in archive mode the live list is a snapshot
+     * of some past date, which would throw away everything founded since.
+     */
+    private static void pruneTownDetailsCache() {
+        if (apiClient == null || isArchiveMode()) return;
+        List<TownData> live = apiClient.getTowns();
+        if (live.isEmpty()) return;
+        Set<String> keep = new java.util.HashSet<>(live.size() * 2);
+        for (TownData t : live) keep.add(townKey(t.name()));
+        int before = townDetailsCache.size();
+        townDetailsCache.keySet().retainAll(keep);
+        int dropped = before - townDetailsCache.size();
+        if (dropped > 0) {
+            LOGGER.info("[TownyMap] Town detail cache: dropped {} entries for towns no longer on the map",
+                    dropped);
+        }
+    }
+
+    /** Removes the v1 cache once v2 exists beside it. It is a few megabytes of data whose fields no
+     *  longer mean what they say, regenerated from the API as towns are opened, and nothing reads it
+     *  any more -- leaving it on disk would only be litter. Best effort: failing to delete it is not
+     *  worth a word to the user. */
+    private static void discardSupersededTownCache() {
+        Path old = FabricLoader.getInstance().getConfigDir()
+                .resolve("townymapaddon")
+                .resolve("town-details-cache.json");
+        if (!Files.isRegularFile(old)) return;
+        try {
+            Files.delete(old);
+            LOGGER.info("[TownyMap] Removed the superseded town detail cache (v1).");
+        } catch (Exception e) {
+            LOGGER.debug("[TownyMap] Could not remove the v1 town detail cache: {}", e.toString());
+        }
+    }
+
     private static Path townDetailsCachePath() {
         return FabricLoader.getInstance().getConfigDir()
                 .resolve("townymapaddon")
-                .resolve("town-details-cache.json");
+                // v2: residentCount switched from "everyone" to the map's total and activeResidentCount
+                // from "-1 unless looked up" to the API's own active figure. A v1 file parses cleanly
+                // into the new record and is silently wrong -- an old town shows no Inactive line and a
+                // stale claim maximum -- so the name changes rather than the contents being trusted.
+                .resolve("town-details-cache-v2.json");
     }
 
     public static void requestMinimapTownHighlightRefresh() {

@@ -34,15 +34,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Injects into Xaero's GuiMap.
  *
- * Rendering order inside method_25394 (Screen.render):
- *   1. renderPreDropdown — waypoints, labels, town overlays (HEAD/RETURN inject here)
- *   2. Squaremap tile compositing (DrawContext flush in onBeforePlayerArrow)
- *   3. Xaero's player arrow (drawArrowOnMap via vertex buffers)
- *   4. method_25394 RETURN — our arrow re-draw fires here, guaranteed on top of tiles
+ * What governs layering here is NOT the order of these injects. Everything we draw goes through
+ * DrawContext, which records into GuiRenderState and is composited after the whole screen
+ * render; everything Xaero draws goes through XaeroBufferProvider.endBatch, which uploads and renders
+ * on the spot. So our layer covers Xaero's terrain, its map elements and its waypoints alike, from any
+ * injection point in method_25394. Moving an inject earlier or later cannot change that, and a
+ * 1.4.11 attempt to fix the buried waypoints that way achieved nothing.
  *
- * Town overlays and info UI render at renderPreDropdown HEAD (clean matrix state).
- * The player arrow MUST render at method_25394 RETURN so it lands after the
- * squaremap DrawContext flush, not before it.
+ * Anything of Xaero's that has to stay visible under our layer must therefore be drawn again by us,
+ * through ctx, in the renderPreDropdown pass. That is what the player arrow has always done, what the
+ * minimap does for its waypoints, and what WorldMapWaypoints now does for the world map's.
  *
  * method_25402 = mouseClicked(Click, boolean) in MC 1.21.11.
  */
@@ -76,6 +77,13 @@ public abstract class MixinGuiMap {
      */
     @Shadow(remap = false) private boolean shouldResetCameraPos;
 
+    /**
+     * Whatever map element of Xaero's the cursor was over on the last frame it drew -- a waypoint, a
+     * tracked player. Xaero keeps it for exactly this purpose: mouseClicked copies it into
+     * viewedOnMousePress and the right-click menu is built from it.
+     */
+    @Shadow(remap = false) private xaero.map.element.HoveredMapElementHolder<?, ?> viewed;
+
     @Shadow(remap = false) private double cameraX;
     @Shadow(remap = false) private double cameraZ;
     @Shadow(remap = false) private double scale;
@@ -102,13 +110,23 @@ public abstract class MixinGuiMap {
                 : original;
     }
 
-    // ── All overlay rendering at HEAD (clean GL/matrix state) ─────────────────
+    // ── All overlay rendering in one pass ───────────────────────────────
 
-    @Inject(require = 0, 
+    /**
+     * Draws our map surface, anchored on the ARROW config read, late in method_25394.
+     *
+     * <p>1.4.11 briefly moved this to just before Xaero's map-element pass, expecting that to let its
+     * waypoints land on top. It could not, for the reason in this class's header. What the move did
+     * change is that our deferred flush and depth-test disable began running BEFORE Xaero's element
+     * pass rather than after it -- no benefit, and our GL fiddling newly upstream of code that had
+     * never run after it. Back where it was.
+     */
+    @Inject(require = 0,
             method = "method_25394",
             at = @At(
                     value = "FIELD",
-                    target = "Lxaero/map/common/config/option/WorldMapProfiledConfigOptions;ARROW:Lxaero/lib/common/config/option/BooleanConfigOption;",
+                    target = "Lxaero/map/common/config/option/WorldMapProfiledConfigOptions;ARROW:"
+                           + "Lxaero/lib/common/config/option/BooleanConfigOption;",
                     opcode = Opcodes.GETSTATIC,
                     shift = At.Shift.BEFORE
             ),
@@ -119,7 +137,7 @@ public abstract class MixinGuiMap {
         // Clear the search bar when the map is reopened (new GuiMap instance) or panned. Tracked on the
         // raw camera every frame, regardless of dimension. jumpTo() suppresses the next pan-clear so that
         // centre-on-select doesn't wipe the bar.
-        TownyMapMod.noteWorldMapInjectAlive();
+        TownyMapMod.noteWorldMapSurfaceAlive();
         TownyMapMod.onWorldMapFrame(this, cameraX, cameraZ);
         // A world switch leaves the camera at coordinates belonging to the world we left. Re-aim before
         // anything is drawn, and suppress the pan-clear so it does not read as the user panning.
@@ -152,6 +170,25 @@ public abstract class MixinGuiMap {
         } catch (Exception e) {
             logOnce(MAP_SURFACE_ERROR_LOGGED, "Failed to render world-map surface overlay", e);
         }
+    }
+
+    /**
+     * Liveness only, so the health check has a signal that does not depend on what Xaero decides to
+     * draw.
+     *
+     * <p>The other two pings sit where they happened to be useful: one at the player-arrow field read,
+     * which Xaero skips entirely when the map UI is hidden, and one in renderPreDropdown. Anchoring
+     * "are our hooks alive?" on either meant a normal Xaero setting could make us announce that Xaero
+     * was incompatible. This one is at the head of the method the whole overlay hangs off, so it fires
+     * on every frame the map draws, and stops only when the thing we actually depend on has moved --
+     * which is exactly what the check is for.
+     *
+     * <p>Intermediary name, like every other hook into this method on this branch.
+     */
+    @Inject(require = 0, method = "method_25394", at = @At("HEAD"), remap = false)
+    private void onExtractRenderStateHead(DrawContext ctx, int mouseX, int mouseY,
+                                          float delta, CallbackInfo ci) {
+        TownyMapMod.noteWorldMapInjectAlive();
     }
 
     @Inject(require = 0, method = "renderPreDropdown", at = @At("HEAD"), remap = false)
@@ -198,6 +235,16 @@ public abstract class MixinGuiMap {
                 double mapScale = guiScale / dimMul;
                 TownyMapMod.renderWorldMapLatePass(ctx, cameraX * dimMul, cameraZ * dimMul, mapScale, w, h);
             }
+            // Xaero's waypoints, over our layer. Xaero draws them into its own vertex buffers, which are
+            // flushed during this render call, while everything we draw is recorded into GuiRenderState
+            // and composited after it -- so our layer covers them wherever it is injected, and the only
+            // way they survive is for us to draw them too. Xaero's own camera and scale: the waypoint
+            // coordinates are in that space, and re-deriving them through the overlay's would only be a
+            // chance to get it wrong.
+            double xaeroScale = (screenScale > 0) ? scale / screenScale : scale;
+            if (xaeroScale > 0.0) {
+                TownyMapMod.renderWorldMapWaypoints(ctx, cameraX, cameraZ, xaeroScale, w, h);
+            }
             // A clean map screenshot skips our own chrome for the frame, so the capture is just the map.
             if (!TownyMapMod.hideChromeForScreenshot()) {
                 double[] world = overlayWorldFromScreen(mouseX, mouseY, w, h);
@@ -231,7 +278,7 @@ public abstract class MixinGuiMap {
     /**
      * Applies a pending world-switch recentre.
      *
-     * <p>Called from both injects on purpose. onBeforePlayerArrow anchors on a field access late in
+     * <p>Called from both injects on purpose. onBeforePlayerArrow anchors on a field access in
      * extractRenderState, and that anchor has silently stopped matching across Xaero updates before;
      * renderPreDropdown is the anchor the whole overlay already depends on, so if the map is drawing at
      * all this one runs. consumeWorldMapRecentre() clears itself, so whichever fires first wins.
@@ -474,6 +521,13 @@ public abstract class MixinGuiMap {
             }
             if (button != 1) return;
 
+            // A right-click on one of Xaero's own map elements belongs to Xaero. Its waypoint menu --
+            // edit, delete, teleport, share -- is only opened from mouseReleased, and only if
+            // mouseClicked ran far enough to set rightMouseButton.isDown, so consuming the click here is
+            // what left waypoints standing on claimed land looking inert: the town panel opened instead
+            // and the waypoint could not be touched at all.
+            if (viewed != null && viewed.isRightClickValid()) return;
+
             double[] world = overlayWorldFromScreen(click.x(), click.y(), sw, sh);
             if (world == null) return;
 
@@ -484,10 +538,41 @@ public abstract class MixinGuiMap {
                 return;
             }
 
-            TownyMapMod.onMapRightClick(world[0], world[1], (int) click.x(), (int) click.y());
-            cir.setReturnValue(true);
+            // Consumed only if the click landed on a claim. Xaero opens its own right-click menu --
+            // add waypoint here, teleport, share location -- from mouseReleased, and only when
+            // mouseClicked got as far as setting rightMouseButton.isDown and recording rightClickX/Y/Z.
+            // Returning true for every right-click meant none of that ever ran, which left the world
+            // map with no way at all to create a waypoint.
+            if (TownyMapMod.onMapRightClick(world[0], world[1], (int) click.x(), (int) click.y())) {
+                cir.setReturnValue(true);
+            }
         } catch (Exception e) {
             logOnce(CLICK_ERROR_LOGGED, "Failed to handle Xaero world-map click", e);
+        }
+    }
+
+    /**
+     * The search bar's hint/history stack scrolls on the wheel.
+     *
+     * <p>Cancels only when the overlay says the cursor was on the stack; every other wheel event falls
+     * through to Xaero, which zooms the map. Swallowing one near the middle of the screen for any other
+     * reason would make the map feel broken.
+     *
+     * <p>Named by its intermediary: Xaero's GuiMap only overrides vanilla's Screen method, so on this
+     * branch there is no "mouseScrolled" left to match and remap = false would miss it in silence.
+     */
+    @Inject(require = 0, method = "method_25401", at = @At("HEAD"), remap = false, cancellable = true)
+    private void onMouseScrolled(double mouseX, double mouseY, double horizontal, double vertical,
+                                 CallbackInfoReturnable<Boolean> cir) {
+        if (TownyMapMod.isAccessBlocked()) return;   // let Xaero handle it as if we were not installed
+        try {
+            MinecraftClient mc = MinecraftClient.getInstance();
+            int sw = mc.getWindow().getScaledWidth();
+            if (TownyMapMod.onTownSearchScroll(mouseX, mouseY, vertical, sw)) {
+                cir.setReturnValue(true);
+            }
+        } catch (Exception e) {
+            logOnce(CLICK_ERROR_LOGGED, "Failed to handle Xaero world-map scroll", e);
         }
     }
 
@@ -565,7 +650,7 @@ public abstract class MixinGuiMap {
      * only JDK types on purpose: xaero.lib is not on our compile classpath, and the descriptors naming
      * it here are plain strings.
      */
-    @Redirect(require = 0, remap = false, method = "extractRenderState",
+    @Redirect(require = 0, remap = false, method = "method_25394",
             slice = @Slice(
                     from = @At(value = "FIELD", opcode = Opcodes.GETSTATIC,
                             target = "Lxaero/map/common/config/option/WorldMapProfiledConfigOptions;"
@@ -585,12 +670,17 @@ public abstract class MixinGuiMap {
      * map without them. Their coordinates belong to the player's world, so on the Moon they would mark
      * lunar ground the player has never stood on.
      */
-    @Redirect(require = 0, remap = false, method = "extractRenderState",
+    @Redirect(require = 0, remap = false, method = "method_25394",
             at = @At(value = "INVOKE",
                     // Name only, no descriptor: the full one names Minecraft types, which are
                     // intermediary at runtime under Fabric's remapped mappings, so a literal
                     // remap = false descriptor would silently never match there. checkWaypoints has a
                     // single overload, so the name resolves it on every branch.
+                    //
+                    // The enclosing method is named by the same rule, and these three redirects spent
+                    // several releases carrying the 26.x name instead: under remap = false nothing
+                    // maps it, nothing on this branch is called extractRenderState, and require = 0
+                    // means a redirect that matches nothing is not an error. They simply never ran.
                     target = "Lxaero/map/mods/SupportXaeroMinimap;checkWaypoints"))
     private void townymap$skipWaypointsOffWorld(
             xaero.map.mods.SupportXaeroMinimap support, boolean enabled,
@@ -606,7 +696,7 @@ public abstract class MixinGuiMap {
      * this returns non-null, so null is all that is needed -- it names the waypoint set of a world the
      * map is not showing, which was the confusing part.
      */
-    @Redirect(require = 0, remap = false, method = "extractRenderState",
+    @Redirect(require = 0, remap = false, method = "method_25394",
             at = @At(value = "INVOKE",
                     target = "Lxaero/map/mods/SupportXaeroMinimap;"
                            + "getSubWorldNameToRender()Ljava/lang/String;"))

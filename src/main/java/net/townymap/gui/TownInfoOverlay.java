@@ -89,16 +89,6 @@ public final class TownInfoOverlay {
         return loading ? null : currentData;
     }
 
-    /** Folds an on-demand active-resident count into the open panel's town (looked up off the base
-     *  fetch). No-op if the panel has since moved to a different town. */
-    public static void setActiveResidentCount(String townName, int count) {
-        TownPopupData d = currentData;
-        if (d != null && d != TownPopupData.WILDERNESS && townName != null
-                && townName.equalsIgnoreCase(d.townName())) {
-            currentData = d.withActiveResidentCount(count);
-        }
-    }
-
     public static void render(DrawContext ctx, int sw, int sh, boolean favorite,
                               Map<String, EarthMcNationData> nationDetails) {
         infoLinks.clear();
@@ -302,17 +292,37 @@ public final class TownInfoOverlay {
         }
         if (archive) {
             lines.add(InfoRow.text("§7PVP: §f§l"   + (d.pvp() ? "是" : "否")));   // archive records PVP, not Open
+        } else if (d.mapOnly()) {
+            // The map states PVP outright but says nothing about Open, so show the one it knows.
+            lines.add(InfoRow.text("§7PVP: §f§l"   + (d.pvp() ? "是" : "否")));
         } else {
             lines.add(InfoRow.text("§7开放: §f§l"  + (d.isOpen() ? "是" : "否")));
         }
         lines.add(InfoRow.text("§7公开: §f§l"    + (d.isPublic() ? "是" : "否")));
-        String residentsLine = "§7居民: §f§l" + d.residentCount();
-        if (d.activeResidentCount() >= 0 && d.activeResidentCount() < d.residentCount()) {
-            residentsLine += " §8(" + (d.residentCount() - d.activeResidentCount()) + " 位不活跃)";
+        // EarthMC's own map leads with the active count, and so does the game: that is the number
+        // that earns chunks and the one people mean by a town's size. The inactive tail goes in the
+        // bracket. Mirrored in TownSearchOverlay#townInfo -- keep the two reading the same.
+        String residentsLine;
+        if (d.activeResidentCount() >= 0 && d.activeResidentCount() <= d.residentCount()) {
+            int inactive = d.residentCount() - d.activeResidentCount();
+            residentsLine = "§7居民: §f§l" + d.activeResidentCount()
+                    + (inactive > 0 ? " §8(不活跃: " + inactive + ")" : "");
+        } else {
+            // Map data only: the roster names everyone, and nothing here can say who still counts.
+            residentsLine = "§7居民: §f§l" + d.residentCount() + " §8(总计)";
         }
         lines.add(InfoRow.text(residentsLine));
-        if (!archive) {
+        // Gold follows balanceKnown, not mapOnly: since EarthMC added /map/v1 a keyless card has a
+        // real bank figure, and gating it on mapOnly hid a number we actually had.
+        if (!archive && d.balanceKnown()) {
             lines.add(InfoRow.text("§7Gold: §f§l"  + formatGold(d.balance())));
+        }
+        // Reached only when this card IS the answer -- no key, or a request that failed. The
+        // right-click path no longer shows a map-built card while a fetch is in flight, so this note
+        // cannot flash up and vanish the way it did.
+        if (d.mapOnly()) {
+            lines.add(InfoRow.text("§8仅地图数据——设置 API 密钥以查看开放状态和领地上限"));
+            lines.add(InfoRow.text("§8以及活跃居民数"));
         }
 
         return lines;

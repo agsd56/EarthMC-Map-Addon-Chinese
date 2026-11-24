@@ -85,6 +85,11 @@ public class TownyMapConfigScreen extends Screen {
                     "压暗地图影像，让城镇边界和玩家光点更醒目。"),
             Map.entry("世界地图全览",
                     "允许超出 Xaero 的常规缩放上限，以查看整张 EarthMC 地图。"),
+            Map.entry("荒野城镇信息",
+                    "右键点击未占领的地面可查询并打开城镇面板，与 1.4.11 之前的行为一致。"
+                            + "关闭时该点击会交给 Xaero 自带菜单，"
+                            + "你可以在那里添加路径点、传送或分享位置；"
+                            + "右键点击已占领的地块则始终打开城镇面板。"),
             Map.entry("深色按钮",
                     "地图上的按钮和本界面使用扁平深色样式，替代原版材质。"),
             Map.entry("荒野玩家警报",
@@ -98,9 +103,10 @@ public class TownyMapConfigScreen extends Screen {
             Map.entry("自定义叠加层",
                     "从配置文件夹加载你自己的 GeoJSON 叠加层。"),
             Map.entry("玩家指示器",
-                    "哪个小地图背景显示标记你的箭头：在 EMC 叠加层上、在 Xaero 自己的地图上、"
-                    + "两者，或关闭。关闭也会在 EMC 叠加层下隐藏它（该层会遮住 "
-                    + "Xaero 自己的箭头）。"),
+                    "选择哪个小地图背景显示标记你的箭头。EMC 叠加层会遮住 Xaero 自带的箭头，"
+                    + "所以我们把自己的箭头画在那里。在 Xaero 自己的地图上，"
+                    + "它的箭头已经绘制，因此“Xaero”和“两者”会在其上再叠加一份。"
+                    + "关闭则在 EMC 叠加层下完全不显示箭头。"),
             Map.entry("区块网格",
                     "在小地图上绘制区块边界。"),
             Map.entry("玩家头像",
@@ -143,7 +149,17 @@ public class TownyMapConfigScreen extends Screen {
                     + "与“选项 > 控制”中的绑定相同，任一处修改都会同步。"),
             Map.entry("查看存档",
                     "输入日期（dd/mm/yyyy）并按回车，查看那天的历史地图。"
-                    + "也可以在世界地图搜索栏中操作，使用 . , 或 / 分隔（例如 17/4/2026）。"));
+                    + "也可以在世界地图搜索栏中操作，使用 . , 或 / 分隔（例如 17/4/2026）。"),
+            Map.entry("EarthMC API 密钥",
+                    "你在 EarthMC 的密钥，用于启用依赖 API 的面板。可选——边界、"
+                    + "城镇名、玩家、搜索和城镇卡片无需密钥即可使用。它只会发送到 api.earthmc.net，"
+                    + "绝不写入日志，且在“全部重置”后保留。"),
+            Map.entry("密钥能提供什么",
+                    "重新打开首次启动时显示的面板：无需密钥已可用的功能、密钥能带来的功能，"
+                    + "以及如何获取密钥。"),
+            Map.entry("清除 API 密钥",
+                    "忘记已保存的密钥。地图功能不受影响，只有依赖 API 的面板停止工作。"
+                    + "你的密钥仍然存在于 EarthMC——/api key copy 可以取回。"));
 
     /** Field-initialised defaults, used to drive the per-row Reset buttons. */
     private static final TownyMapConfig DEFAULTS = new TownyMapConfig();
@@ -153,12 +169,17 @@ public class TownyMapConfigScreen extends Screen {
     private TownyMapConfig cfg;
     private TextFieldWidget searchField;
     private TextFieldWidget archiveField;   // Advanced → type a dd/mm/yyyy date + Enter to open the archive
+    private TextFieldWidget apiKeyField;    // Advanced → the EarthMC API key; never pre-filled
     private ButtonWidget screenshotKeyButton;
     private ButtonWidget refreshKeyButton;
     private ButtonWidget statsKeyButton;   // Advanced → rebind the clean-map-screenshot key
     private boolean awaitingScreenshotKey;
     private boolean awaitingRefreshKey;
     private boolean awaitingStatsKey;
+    /** Last value the key box settled on, and when -- see {@link #tick()}. */
+    private String pendingApiKey = "";
+    private long pendingApiKeyAtMs = 0L;
+    private int lastApiKeyLength = 0;
     private String searchQuery = "";
     private int scrollOffset;
     private int contentHeight;
@@ -273,6 +294,10 @@ public class TownyMapConfigScreen extends Screen {
         option("搜索结果闪烁", onOff(cfg.searchFlash, v -> cfg.searchFlash = v),
                 () -> cfg.searchFlash == DEFAULTS.searchFlash,
                 () -> cfg.searchFlash = DEFAULTS.searchFlash);
+        option("搜索历史", onOff(cfg.recordSearchHistory, v -> cfg.recordSearchHistory = v),
+                () -> cfg.recordSearchHistory == DEFAULTS.recordSearchHistory,
+                () -> cfg.recordSearchHistory = DEFAULTS.recordSearchHistory);
+        action("清除搜索历史", TownyMapMod::clearSearchHistory);
         action("重新加载领地", TownyMapMod::refreshTownClaimsFromSettings);
         refreshKeyButton = ButtonWidget.builder(refreshKeyLabel(), b -> {
             awaitingRefreshKey = true;
@@ -312,6 +337,9 @@ public class TownyMapConfigScreen extends Screen {
         option("远缩放城镇圆点", onOff(cfg.farZoomTownDots, v -> cfg.farZoomTownDots = v),
                 () -> cfg.farZoomTownDots == DEFAULTS.farZoomTownDots,
                 () -> cfg.farZoomTownDots = DEFAULTS.farZoomTownDots);
+        option("荒野城镇信息", onOff(cfg.wildernessTownInfo, v -> cfg.wildernessTownInfo = v),
+                () -> cfg.wildernessTownInfo == DEFAULTS.wildernessTownInfo,
+                () -> cfg.wildernessTownInfo = DEFAULTS.wildernessTownInfo);
         option("真实国界", cycle(cfg.borderOverlayMode, new int[]{0, 1, 2},
                         TownyMapConfigScreen::borderModeText, v -> cfg.borderOverlayMode = v),
                 () -> cfg.borderOverlayMode == DEFAULTS.borderOverlayMode,
@@ -425,6 +453,38 @@ public class TownyMapConfigScreen extends Screen {
         archiveField.setPlaceholder(Text.literal("dd/mm/yyyy"));
         archiveField.setMaxLength(14);
         inputRow("查看存档", archiveField);
+
+        // A category rather than the tail of Advanced. The key is the one setting here that is not a
+        // preference: it is a credential, it has a state of its own that the rows report, and it is
+        // what someone arrives in settings looking for after reading the notice. Buried under the
+        // overlay and waypoint options it read like an afterthought, and was four screens of
+        // scrolling from the top.
+        section("API 密钥");
+        // EarthMC requires a key on every endpoint from 2026-11-19, so this row is what turns the
+        // API-backed panels on. The stored key is deliberately NOT loaded into the box: a settings
+        // screen gets screenshotted and streamed, and a secret that is never drawn cannot leak that
+        // way. Typing a new one replaces it; the button below clears it.
+        apiKeyField = new TextFieldWidget(this.textRenderer, ctrlX, 0, CTRL_W, 20, Text.literal("EarthMC API 密钥"));
+        apiKeyField.setPlaceholder(Text.literal(cfg.earthMcApiKey.isEmpty()
+                ? ApiKeyCaptureFlow.KEY_COMMAND : "已设置——输入新密钥以替换"));
+        // Generous on purpose. A real EarthMC key is a signed token, not a short id -- a live one
+        // measured 171 characters -- and an EditBox does not say it truncated, it just silently
+        // drops the tail. A key cut short is a key EarthMC refuses, with nothing on screen to
+        // explain why, so this must never be tightened to a guess at the current length.
+        apiKeyField.setMaxLength(512);
+        apiKeyField.setChangedListener(this::onApiKeyTyped);
+        inputRow("EarthMC API 密钥", apiKeyField);
+        action(apiKeyButtonLabel(), this::submitApiKey);
+        action(apiKeyChatLabel(), this::startKeyCapture);
+        // Reachable on purpose. The notice panel showed itself once per install and had no other
+        // door: a player who closed it by accident, or lost it to a join that had not settled, could
+        // not get the instructions back. It explains what a key adds and what already works without
+        // one, which is worth reading more than once.
+        action("密钥能提供什么", () -> net.townymap.TownyMapMod.showApiKeyNotice(this));
+        if (!cfg.earthMcApiKey.isEmpty()) {
+            action(apiKeyCopyLabel(), this::copyApiKey);
+            action("清除 API 密钥", this::clearApiKey);
+        }
 
 
         this.addDrawableChild(
@@ -683,6 +743,12 @@ public class TownyMapConfigScreen extends Screen {
             if (screenshotKeyButton != null) screenshotKeyButton.setMessage(screenshotKeyLabel());
             return true;
         }
+        // Enter in the key field saves and tests it, rather than making the user find the button.
+        if (apiKeyField != null && apiKeyField.isFocused()
+                && (input.key() == GLFW.GLFW_KEY_ENTER || input.key() == GLFW.GLFW_KEY_KP_ENTER)) {
+            submitApiKey();
+            return true;
+        }
         // Enter in the archive-date field opens that day's archive and closes settings.
         if (archiveField != null && archiveField.isFocused()
                 && (input.key() == GLFW.GLFW_KEY_ENTER || input.key() == GLFW.GLFW_KEY_KP_ENTER)) {
@@ -690,6 +756,124 @@ public class TownyMapConfigScreen extends Screen {
             return true;
         }
         return super.keyPressed(input);
+    }
+
+    /**
+     * Saves a newly typed key, then asks EarthMC to confirm it. An empty box means "just re-test the
+     * key I already have", so the button works as both. The value is never logged or echoed back.
+     */
+    /**
+     * Submits the key on its own, so Enter is a shortcut rather than a requirement.
+     *
+     * <p>Enter was the only way to commit a typed key, and people reported keys that never took --
+     * the box holds the value quite happily without it, and nothing on screen says it is waiting.
+     *
+     * <p>A paste arrives as one change that jumps the length by the whole key, and is committed
+     * almost at once. A key typed by hand grows a character at a time, and waits much longer for the
+     * typing to stop, so a pause in the middle of typing cannot submit half a key.
+     */
+    private void onApiKeyTyped(String value) {
+        String v = TownyMapConfig.normalizeApiKey(value);
+        int jumped = v.length() - lastApiKeyLength;
+        lastApiKeyLength = v.length();
+        if (v.length() < MIN_PLAUSIBLE_KEY) { pendingApiKey = ""; pendingApiKeyAtMs = 0L; return; }
+        pendingApiKey = v;
+        pendingApiKeyAtMs = System.currentTimeMillis() + (jumped >= 20 ? 0L : TYPED_SETTLE_MS);
+    }
+
+    /** Shortest thing worth treating as a whole key; matches ApiKeyCapture's own floor. */
+    private static final int MIN_PLAUSIBLE_KEY = 48;
+    /** How long typing must stop before a hand-typed key is committed. */
+    private static final long TYPED_SETTLE_MS = 1_500L;
+    /** Settle time after the jump, for both paths. */
+    private static final long COMMIT_DELAY_MS = 350L;
+
+    @Override
+    public void tick() {
+        super.tick();
+        // Deliberately no rebuild for the capture countdown. clearAndInit() recreates the key box,
+        // which is never prefilled, so ticking a label would wipe whatever was being typed into it --
+        // and the window is normally counting down with this screen closed anyway. The label is read
+        // once, when the screen opens.
+        if (pendingApiKeyAtMs == 0L || apiKeyField == null) return;
+        if (System.currentTimeMillis() - pendingApiKeyAtMs < COMMIT_DELAY_MS) return;
+        if (!TownyMapConfig.normalizeApiKey(apiKeyField.getText()).equals(pendingApiKey)) return;
+        pendingApiKey = "";
+        pendingApiKeyAtMs = 0L;
+        lastApiKeyLength = 0;
+        submitApiKey();
+    }
+
+
+    private String apiKeyChatLabel() {
+        return net.townymap.api.ApiKeyCapture.armed()
+                ? "正在读取聊天……剩余 " + net.townymap.api.ApiKeyCapture.secondsLeft() + " 秒"
+                : "从聊天中获取密钥";
+    }
+
+    /** Separate from the chat row because it answers a different question: not "what is my key" but
+     *  "give me the one I already have" -- for a second instance, another launcher, or just to see
+     *  what is actually saved, which the box deliberately never shows. */
+    private String apiKeyCopyLabel() {
+        return apiKeyCopied ? "API 密钥已复制到剪贴板" : "复制 API 密钥";
+    }
+
+    private boolean apiKeyCopied = false;
+
+    /** The player's own key, onto their own clipboard, on their own click. It goes nowhere else. */
+    private void copyApiKey() {
+        net.minecraft.client.MinecraftClient mc = this.client;
+        if (mc == null || mc.keyboard == null || cfg.earthMcApiKey.isEmpty()) return;
+        mc.keyboard.setClipboard(cfg.earthMcApiKey);
+        apiKeyCopied = true;
+        this.clearAndInit();
+    }
+
+    /** Asks before reading anything, then closes settings so the command can actually be typed. */
+    /**
+     * The settings row's own half of the flow: a toggle, because this row doubles as the countdown
+     * and pressing it again is how a player calls the window off. The prompt and the arming live in
+     * {@link ApiKeyCaptureFlow}, which the first-launch notice offers too.
+     */
+    private void startKeyCapture() {
+        if (net.townymap.api.ApiKeyCapture.armed()) {
+            net.townymap.api.ApiKeyCapture.cancel();
+            this.clearAndInit();
+            return;
+        }
+        ApiKeyCaptureFlow.start(this);
+    }
+
+    private void submitApiKey() {
+        String typed = TownyMapConfig.normalizeApiKey(apiKeyField.getText());
+        if (!typed.isEmpty()) {
+            cfg.earthMcApiKey = typed;
+            cfg.save();
+            apiKeyCopied = false;      // the label referred to a key that is no longer the one stored
+            apiKeyField.setText("");   // do not leave it sitting on screen
+        }
+        TownyMapMod.applyApiKey();
+        this.clearAndInit();     // the button label carries the new state
+    }
+
+    private void clearApiKey() {
+        cfg.earthMcApiKey = "";
+        cfg.save();
+        apiKeyCopied = false;
+        apiKeyField.setText("");
+        TownyMapMod.applyApiKey();
+        this.clearAndInit();
+    }
+
+    /** The button doubles as the status readout -- there is nowhere else on the row to put it. */
+    private String apiKeyButtonLabel() {
+        net.townymap.api.ApiKeyState state = TownyMapMod.apiKeyState();
+        return switch (state) {
+            case OK -> "API 密钥：已通过——点击重新测试";
+            case REJECTED -> "API 密钥：被 EarthMC 拒绝——点击重新测试";
+            case UNVERIFIED -> "API 密钥：已设置，尚未验证——点击测试";
+            case MISSING -> "API 密钥：未设置——EarthMC 查询已关闭";
+        };
     }
 
     private void submitArchive() {
@@ -865,6 +1049,10 @@ public class TownyMapConfigScreen extends Screen {
 
     @Override
     public void close() {
+        // Every control saves itself as it is changed, so this is normally a no-op. It stays as the
+        // backstop for anything that edits the config without saving -- which the API key field used to
+        // be, writing per keystroke and saving only here, before that setting was removed.
+        cfg.save();
         this.client.setScreen(parent);
     }
 

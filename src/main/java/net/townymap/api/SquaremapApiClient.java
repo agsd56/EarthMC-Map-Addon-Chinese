@@ -27,9 +27,11 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
@@ -46,8 +48,8 @@ public class SquaremapApiClient {
     private static final String PLAYER_HISTORY_FILE = "townymapaddon-player-history.json";
     private static final int MAX_PLAYER_HISTORY = 800;
     private static final long TOWN_MARKER_REFRESH_MS = 60_000L;
-    // squaremap regenerates players.json ~every 1.2s (measured: min 0.68s, max 2.07s), so fetching at ~1s
-    // captures essentially every update — faster just re-downloads identical data. This is the live player
+    // The player feed regenerates about once a second (max-age=1), so fetching at ~1s captures
+    // essentially every update — faster just re-asks for data we already have. This is the live player
     // rate, independent of the (coarser, non-UI) refreshPlayersSecs config.
     private static final long PLAYER_REFRESH_MS = 1_000L;
     /** Cadence with only the minimap up -- see {@link #tickPlayers()}. */
@@ -88,7 +90,25 @@ public class SquaremapApiClient {
     private static final Pattern POPUP_MAYOR =
             Pattern.compile("(?is)Mayor:\\s*<b[^>]*>(.*?)</b>");
     // Nation from the tooltip: "<b>Town</b> (Member of X)" or "(Capital of X)". Absent for nationless towns.
-    // Group 1 = Member|Capital (kept so capitals can read "Capital of X" like the right-click title).
+    // Group 1 = Member|Capital, group 2 = the nation, and the two are deliberately kept APART. Group 2
+    // alone goes into townNations, because nearly everything that asks a town for its nation is matching,
+    // grouping or counting it -- and a capital whose nation read "Capital of X" matched nothing, split its
+    // nation's row in the Stats tables in two and left its residents colourless on the map. Group 1 goes
+    // into capitalTowns, and getTownNationLabel puts the two back together for the titles that want it.
+    /** The town board, the one italic line in the popup: "<i>De Nile is a river in Egypt.</i>".
+     *  Exactly one {@code <i>} appears per popup across all 5,801 of them, and its text matches the
+     *  API's own {@code board} verbatim. No unescaping: squaremap emits no HTML entities at all in
+     *  this file, and the mayor, nation and founded parsers beside this one make the same assumption. */
+    private static final Pattern POPUP_BOARD =
+            Pattern.compile("(?is)<i>(.*?)</i>");
+    /** "Founded: <b>May 8 2026</b>" -- the same date string the API's timestamps format to. */
+    private static final Pattern POPUP_FOUNDED =
+            Pattern.compile("(?is)Founded:\\s*<b[^>]*>(.*?)</b>");
+    private static final Pattern POPUP_PVP =
+            Pattern.compile("(?is)PVP:\\s*<b[^>]*>\\s*(true|false)\\s*</b>");
+    private static final Pattern POPUP_PUBLIC =
+            Pattern.compile("(?is)Public:\\s*<b[^>]*>\\s*(true|false)\\s*</b>");
+
     private static final Pattern POPUP_NATION =
             Pattern.compile("(?is)\\(\\s*(Member|Capital) of\\s+(.*?)\\)");
 
@@ -106,15 +126,34 @@ public class SquaremapApiClient {
      * 47, so the second world is nearly free.
      */
     private volatile Map<String, List<TownData>> townsByWorld = Map.of();
-    /** Town key -> geometry the API gave us, standing in until the map publishes the same claims. */
+    /**
+     * world + town key -> geometry the API gave us, standing in until the map publishes the same claims.
+     *
+     * <p>Keyed by WORLD as well as town, because a Moon outpost is the same town entity as its Earth
+     * claim and carries the same name -- all 374 of the Moon's towns share a name with an Earth one. A
+     * name-only key therefore collided for every one of them, and an Earth override would replace the
+     * Moon town's outline with Earth geometry at Earth coordinates: the Moon claim vanished and its real
+     * location read as wilderness.
+     */
     private volatile Map<String, TownData> townGeometryOverrides = Map.of();
     private final Map<String, Long> townGeometryOverrideAt = new ConcurrentHashMap<>();
+
+    /** Overrides are per world; a bare town name is ambiguous across Earth and the Moon. */
+    private static String overrideKey(String world, String townKey) {
+        return world + '\0' + townKey;   // \0, not \u0000: a unicode escape is processed before lexing
+    }
     /** An override stands in for publish lag. Past this it is the suspect one, not the map. */
     private static final long GEOMETRY_OVERRIDE_MAX_AGE_MS = 180_000L;
     private volatile List<PlayerMarker> players      = List.of();
     private volatile Map<String, PlayerHistoryEntry> playerHistory = Map.of();
     private volatile Map<String, String> townMayors  = Map.of();   // townKey → mayor, parsed from popups
     private volatile Map<String, Integer> townResidents = Map.of(); // townKey → resident count, from popups
+    /** townKey -> chunks claimed, counted from the map's own borders. See {@link #getTownChunks}. */
+    private volatile Map<String, Integer> townChunks = Map.of();
+    /** townKey -> the rest of what the popup states outright. See {@link MapTownFacts}. */
+    private volatile Map<String, MapTownFacts> townFacts = Map.of();
+    /** nation (lower case) -> the totals across its towns. See {@link MapNationFacts}. */
+    private volatile Map<String, MapNationFacts> nationFacts = Map.of();
     /**
      * Lower-cased player name → the town whose roster lists them, built from the same popups.
      *
@@ -125,6 +164,11 @@ public class SquaremapApiClient {
     private volatile Map<String, String> residentTowns = Map.of();
     private volatile Map<String, String> residentNations = Map.of();
     private volatile Map<String, String> townNations = Map.of();   // townKey → nation, parsed from tooltips
+    /** Town keys whose tooltip read "Capital of" rather than "Member of". The nation's name is in
+     *  townNations either way; only a title and the capital test itself need to know which it was. */
+    private volatile Set<String> capitalTowns = Set.of();
+    /** townKey -> the capital's name as the map spells it, for display beside its star. */
+    private volatile Map<String, String> capitalDisplayNames = Map.of();
 
     private final AtomicBoolean markerFetchRunning = new AtomicBoolean(false);
     private final AtomicBoolean playerFetchRunning = new AtomicBoolean(false);
@@ -143,8 +187,8 @@ public class SquaremapApiClient {
     /**
      * Remembers how long the server said this document stays fresh.
      *
-     * <p>squaremap publishes its intent on every response -- markers.json says {@code max-age=120},
-     * players.json says {@code max-age=1} -- and we were polling markers every 60 seconds, twice as
+     * <p>Both hosts publish their intent on every response -- markers.json says {@code max-age=120},
+     * the player feed says {@code max-age=1} -- and we were polling markers every 60 seconds, twice as
      * often as asked. Those extra polls come back 304 so they cost little, but they are still requests
      * nobody wanted, and reading the header means that if EarthMC ever raises it to shed load we slow
      * down on our own instead of waiting for a mod update.
@@ -180,6 +224,9 @@ public class SquaremapApiClient {
 
     /** Last ETag seen per URL, so we can ask the server to skip sending unchanged data. */
     private final Map<String, String> etags = new ConcurrentHashMap<>();
+    /** Last-Modified per URL, for documents that revalidate by date instead of ETag -- the EarthMC
+     *  player feed offers no ETag, and at one poll a second the 304s are the whole saving. */
+    private final Map<String, String> lastModified = new ConcurrentHashMap<>();
     /** Unique instance: get() returns this when the server said 304, so it is distinct from any body. */
     private static final String NOT_MODIFIED = new String("__not_modified__");
     private volatile boolean markerFetchFailing = false;
@@ -235,25 +282,25 @@ public class SquaremapApiClient {
      * for this one as soon as it publishes the same claims.
      */
     public void overrideTownGeometry(String world, TownData replacement) {
-        if (replacement == null) return;
+        if (replacement == null || world == null) return;
+        String key = overrideKey(world, replacement.key());
         Map<String, TownData> next = new HashMap<>(townGeometryOverrides);
-        next.put(replacement.key(), replacement);
+        next.put(key, replacement);
         townGeometryOverrides = Map.copyOf(next);
-        townGeometryOverrideAt.put(replacement.key(), System.currentTimeMillis());
+        townGeometryOverrideAt.put(key, System.currentTimeMillis());
         applyGeometryOverrides(world);
     }
 
     /** Drops an override, so the town goes back to whatever the map says. */
     public void clearTownGeometryOverride(String world, String townKey) {
-        if (townKey == null || !townGeometryOverrides.containsKey(townKey)) return;
+        if (townKey == null || world == null) return;
+        String key = overrideKey(world, townKey);
+        if (!townGeometryOverrides.containsKey(key)) return;
         Map<String, TownData> next = new HashMap<>(townGeometryOverrides);
-        next.remove(townKey);
+        next.remove(key);
         townGeometryOverrides = Map.copyOf(next);
+        townGeometryOverrideAt.remove(key);
         applyGeometryOverrides(world);
-    }
-
-    public TownData townGeometryOverride(String townKey) {
-        return townKey == null ? null : townGeometryOverrides.get(townKey);
     }
 
     /**
@@ -275,12 +322,12 @@ public class SquaremapApiClient {
             if (now - e.getValue() > GEOMETRY_OVERRIDE_MAX_AGE_MS) done.add(e.getKey());
         }
         for (TownData town : parsed) {
-            TownData over = overrides.get(town.key());
+            TownData over = overrides.get(overrideKey(world, town.key()));
             if (over == null) continue;
             if (town.minX() <= over.minX() && town.maxX() >= over.maxX()
                     && town.minZ() <= over.minZ() && town.maxZ() >= over.maxZ()
                     && town.approximateChunks() == over.approximateChunks()) {
-                done.add(town.key());
+                done.add(overrideKey(world, town.key()));
             }
         }
         if (done.isEmpty()) return;
@@ -297,7 +344,7 @@ public class SquaremapApiClient {
         List<TownData> updated = new ArrayList<>(current.size());
         boolean changed = false;
         for (TownData town : current) {
-            TownData over = overrides.get(town.key());
+            TownData over = overrides.get(overrideKey(world, town.key()));
             if (over != null && over != town) { updated.add(over); changed = true; }
             else updated.add(town);
         }
@@ -321,8 +368,92 @@ public class SquaremapApiClient {
     }
 
     /** Mayor parsed from the squaremap popup for this town key, or null if unknown. */
+    /**
+     * Chunks claimed by one town, counted from the borders the map already publishes -- no request,
+     * where the API would otherwise be asked.
+     *
+     * <p>The borders ARE the claim boundary, so the area they enclose divided by 256 (16x16 blocks to
+     * a chunk) is the claim count. Summed over every world: a town's Moon outposts count toward its
+     * total, and the overworld markers alone fall short by exactly those.
+     *
+     * <p>Measured against the API over 267 towns, including all 54 whose rings nest: 266 exact. The
+     * one miss is a border that pinches shut around an unclaimed pocket, which no ring-level rule can
+     * see. A caller holding a figure the API has already given should prefer that one.
+     *
+     * @return the chunk count, or -1 for a town the map has no geometry for.
+     */
+    public int getTownChunks(String townKey) {
+        if (townKey == null) return -1;
+        Integer n = townChunks.get(townKey);
+        return n == null ? -1 : n;
+    }
+
+    /**
+     * What a town's own popup states outright, with no API call behind any of it.
+     *
+     * <p>These are the fields squaremap prints in full; everything else on a town card -- its balance,
+     * whether it is open or for sale, how much it may claim -- exists only in the API.
+     */
+    public record MapTownFacts(String board, String founded, boolean pvp, boolean isPublic) {}
+
+    /**
+     * What the map alone can say about a nation, added up from the towns that name it.
+     *
+     * <p>Nations are not markers -- only towns are -- so everything here is a total over the towns
+     * whose tooltip says they belong. That covers the capital, the town count, the resident roll and
+     * the claimed area. A nation's king, its founding date, its balance and its chunk bonus appear
+     * nowhere on the map and need the API.
+     *
+     * <p>Built once per markers refresh rather than per frame: the card that reads it is rebuilt
+     * every frame the panel is open, and this walks every town on the server.
+     */
+    public record MapNationFacts(String capital, int townCount, int residentCount, int chunkCount) {}
+
+    /** @return the map's totals for this nation, or null if no town names it. */
+    public MapNationFacts getNationFacts(String nationName) {
+        if (nationName == null || nationName.isBlank()) return null;
+        return nationFacts.get(nationName.toLowerCase(Locale.ROOT));
+    }
+
+    /** @return the popup's own facts for this town, or null if the map has none. */
+    public MapTownFacts getTownFacts(String townKey) {
+        return townKey == null ? null : townFacts.get(townKey);
+    }
+
+    /**
+     * Each nation's capital, as the map itself names it: nation (lower case) -> capital town name.
+     * Built from the "(Capital of X)" tooltips, so the capital stars can be drawn with no API key.
+     */
+    public Map<String, String> nationCapitals() {
+        Map<String, String> out = new HashMap<>();
+        for (String townKey : capitalTowns) {
+            String nation = townNations.get(townKey);
+            String display = capitalDisplayNames.get(townKey);
+            if (nation != null && !nation.isBlank() && display != null) {
+                out.put(nation.toLowerCase(Locale.ROOT), display);
+            }
+        }
+        return out;
+    }
+
     public String getTownMayor(String townKey) { return townKey == null ? null : townMayors.get(townKey); }
+    /**
+     * The town's nation, plain: "Switzerland", never "Capital of Switzerland".
+     *
+     * <p>This is the form to match, group and count by. {@link #getTownNationLabel} is for the two titles
+     * that show the capital in words.
+     */
     public String getTownNation(String townKey) { return townKey == null ? null : townNations.get(townKey); }
+
+    /** Whether the town is its nation's capital, as its own squaremap tooltip said. */
+    public boolean isTownCapital(String townKey) { return townKey != null && capitalTowns.contains(townKey); }
+
+    /** The nation as a title -- "Capital of Switzerland" for a capital, otherwise just the nation. */
+    public String getTownNationLabel(String townKey) {
+        String nation = getTownNation(townKey);
+        if (nation == null) return null;
+        return isTownCapital(townKey) ? "Capital of " + nation : nation;
+    }
     /** Players on the world the map is showing. */
     public List<PlayerMarker> getPlayers() { return getPlayers(TownyMapMod.activeWorldKey()); }
 
@@ -442,18 +573,23 @@ public class SquaremapApiClient {
         scheduler.schedule(this::forceTownMarkerRefresh, Math.max(0, delayMs), TimeUnit.MILLISECONDS);
     }
 
-    /** Refreshes player positions from squaremap's players.json (NOT the EarthMC API). Driven by both the
-     *  world map and the minimap at the live PLAYER_REFRESH_MS rate (~1s, matching squaremap's own update
-     *  cadence) and de-duped via playerFetchRunning, so positions stay live during normal play (minimap)
-     *  and not just while the full map is open. */
+    /** Refreshes player positions from EarthMC's map player feed. Driven by both the world map and the
+     *  minimap at the live PLAYER_REFRESH_MS rate (~1s, matching the feed's own update cadence) and
+     *  de-duped via playerFetchRunning, so positions stay live during normal play (minimap) and not
+     *  just while the full map is open. */
     /**
-     * Polls squaremap's player feed, faster while the world map is open.
+     * Polls EarthMC's player feed, faster while the world map is open.
      *
-     * <p>players.json is the one document that never revalidates: it changes every tick by design, so
-     * every poll is a full body and the interval is a straight multiplier on bandwidth -- roughly 24 MB
-     * an hour at one second. That rate only buys anything on the world map, where dots are watched
-     * moving across a wide view. On the minimap alone, where they are a handful of pixels near the
-     * player, a slower poll is not visible, so it is not worth paying for.
+     * <p>The squaremap file this replaced never revalidated, so every poll was a full body and the
+     * interval was a straight multiplier on bandwidth -- roughly 24 MB an hour at one second. The
+     * endpoint on the API host does honour If-Modified-Since, so polls landing inside the same second
+     * now cost an empty 304. The interval still matters: a body is ~2.9 KB gzipped and the rate only
+     * buys anything on the world map, where dots are watched moving across a wide view. On the minimap
+     * alone, where they are a handful of pixels near the player, a slower poll is not visible.
+     *
+     * <p>It also spends the API rate limit (180 requests a minute, per client -- no key involved), and one
+     * poll a second is a third of it before any town or nation lookup, which is the other reason not
+     * to go faster.
      *
      * <p>markers.json is deliberately left alone: it carries an ETag and only regenerates every few
      * minutes, so the polls in between already cost nothing and slowing them down would buy staleness
@@ -488,6 +624,13 @@ public class SquaremapApiClient {
         java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
         out.add(TownyMapMod.activeWorldKey());
         out.add(TownyMapMod.playerWorldResolved());
+        // Both of EarthMC's worlds, always -- a town's claim total spans them, and its roster is
+        // published in each. Loading only the world on screen undercounted every town with a Moon
+        // outpost: Nile read 465 chunks against the API's 484, the missing 19 being its Moon claim.
+        // Cheap to keep current: these requests are conditional, so an unchanged world costs a 304,
+        // and the Moon file is a fourteenth the size of the overworld's.
+        out.add(TownyMapMod.WORLD_OVERWORLD);
+        out.add(TownyMapMod.WORLD_MOON);
         return out;
     }
 
@@ -553,15 +696,32 @@ public class SquaremapApiClient {
         Map<String, String> nations = new HashMap<>();
         Map<String, Integer> residents = new HashMap<>();
         Map<String, String> residentTown = new HashMap<>();
+        Map<String, Integer> chunks = new HashMap<>();
+        Set<String> capitals = new HashSet<>();
+        Map<String, MapTownFacts> factsAll = new HashMap<>();
+        Map<String, String> capitalNamesAll = new HashMap<>();
         for (ParsedMarkers m : markersByWorld.values()) {
             mayors.putAll(m.mayors());
             nations.putAll(m.nations());
             residents.putAll(m.residents());
             residentTown.putAll(m.residentTowns());
+            capitals.addAll(m.capitals());
+            factsAll.putAll(m.facts());
+            capitalNamesAll.putAll(m.capitalNames());
+            // Chunks are the one value that SUMS rather than replaces: the roster in a Moon popup is
+            // the whole town's, but the claim drawn there is only the part of it on the Moon.
+            for (TownData t : m.towns()) {
+                chunks.merge(t.name().toLowerCase(Locale.ROOT), t.approximateChunks(), Integer::sum);
+            }
         }
         townMayors = Map.copyOf(mayors);
         townNations = Map.copyOf(nations);
+        capitalTowns = Set.copyOf(capitals);
         townResidents = Map.copyOf(residents);
+        townChunks = Map.copyOf(chunks);
+        townFacts = Map.copyOf(factsAll);
+        capitalDisplayNames = Map.copyOf(capitalNamesAll);
+        nationFacts = Map.copyOf(buildNationFacts(nations, residents, chunks, capitalNamesAll));
         residentTowns = Map.copyOf(residentTown);
         // Resident -> nation, resolved once here rather than per player per frame. The town value is a
         // display name and townNations is keyed lower-case, so this is where the one lower-casing goes.
@@ -605,15 +765,34 @@ public class SquaremapApiClient {
         return changed ? List.copyOf(merged) : current;
     }
 
+    /** How long EarthMC's copy is used after the map's fails, before the map's is tried again. */
+    private static final long PLAYERS_FALLBACK_MS = 300_000L;
+    private volatile long playersFallbackUntil = 0L;
+    private final java.util.concurrent.atomic.AtomicBoolean playersFallbackLogged =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
     private void fetchPlayers() {
         try {
-            String json = get(config.playersUrl());
+            long now = System.currentTimeMillis();
+            // Exactly one request per poll either way. The switch is stamped before the request that
+            // would justify it, so a feed that is simply down can never turn this into a retry loop.
+            boolean onFallback = now < playersFallbackUntil;
+            String url = onFallback ? config.playersFallbackUrl() : config.playersUrl();
+            String json = get(url);
             if (json == NOT_MODIFIED) return;   // same positions as last poll; nothing to re-parse
-            if (json != null) {
-                List<PlayerMarker> parsed = List.copyOf(parsePlayers(json));
-                players = parsed;
-                rememberPlayers(parsed);
+            if (json == null) {
+                if (!onFallback) {
+                    playersFallbackUntil = now + PLAYERS_FALLBACK_MS;
+                    if (playersFallbackLogged.compareAndSet(false, true)) {
+                        LOGGER.info("[TownyMap] The map's player feed is not answering; falling back to"
+                                + " EarthMC's copy. The map's will be tried again periodically.");
+                    }
+                }
+                return;
             }
+            List<PlayerMarker> parsed = List.copyOf(parsePlayers(json));
+            players = parsed;
+            rememberPlayers(parsed);
         } finally {
             playerFetchRunning.set(false);
         }
@@ -685,6 +864,8 @@ public class SquaremapApiClient {
      * transfer simply does not finish. squaremap has always offered gzip; we just never asked.
      */
     private String get(String url) {
+        // Serves two hosts since 2026-11-03: squaremap for claims and imagery, EarthMC's API host for
+        // the player feed that replaced tiles/players.json. Neither is authenticated.
         try {
             HttpRequest.Builder reqB = HttpRequest.newBuilder()
                     .uri(URI.create(url))
@@ -698,12 +879,17 @@ public class SquaremapApiClient {
             // different tag per encoding, and mixing them silently defeats the whole thing.
             String prior = etags.get(url);
             if (prior != null) reqB.header("If-None-Match", prior);
+            // The player feed revalidates by date instead: no ETag, but it does honour If-Modified-Since,
+            // which the squaremap file it replaced never did. Worth asking for at a poll a second.
+            String since = lastModified.get(url);
+            if (prior == null && since != null) reqB.header("If-Modified-Since", since);
             HttpRequest req = reqB.build();
             HttpResponse<byte[]> resp = http.send(req, HttpResponse.BodyHandlers.ofByteArray());
             noteCachePolicy(url, resp);
             if (resp.statusCode() == 304) return NOT_MODIFIED;
             if (resp.statusCode() == 200) {
                 resp.headers().firstValue("ETag").ifPresent(tag -> etags.put(url, tag));
+                resp.headers().firstValue("Last-Modified").ifPresent(d -> lastModified.put(url, d));
                 return decodeBody(resp);
             }
             LOGGER.warn("[TownyMap] HTTP {} from {}", resp.statusCode(), url);
@@ -733,21 +919,28 @@ public class SquaremapApiClient {
      */
     /** One world's parsed markers: polygons plus the town-identity maps read out of the popups. */
     private record ParsedMarkers(List<TownData> towns, Map<String, String> mayors,
-                                 Map<String, String> nations, Map<String, Integer> residents,
-                                 Map<String, String> residentTowns) {}
+                                 Map<String, String> nations, Set<String> capitals,
+                                 Map<String, Integer> residents,
+                                 Map<String, String> residentTowns,
+                                 Map<String, MapTownFacts> facts,
+                                 Map<String, String> capitalNames) {}
 
     private ParsedMarkers parseMarkers(String json) {
         List<TownData> towns = new ArrayList<>();
         Map<String, String> mayors = new HashMap<>();
         Map<String, Integer> residents = new HashMap<>();
+        Map<String, MapTownFacts> facts = new HashMap<>();
+        Map<String, String> capitalNames = new HashMap<>();
         Map<String, String> residentTown = new HashMap<>();
         int markerFailures = 0;
         Map<String, String> nations = new HashMap<>();
+        Set<String> capitals = new HashSet<>();
         try {
             JsonElement root = JsonParser.parseString(json);
             if (!root.isJsonArray()) {
                 LOGGER.warn("[TownyMap] markers.json: expected top-level array");
-                return new ParsedMarkers(towns, Map.of(), Map.of(), Map.of(), Map.of());
+                return new ParsedMarkers(towns, Map.of(), Map.of(), Set.of(), Map.of(), Map.of(),
+                        Map.of(), Map.of());
             }
 
             for (JsonElement layerEl : root.getAsJsonArray()) {
@@ -780,6 +973,11 @@ public class SquaremapApiClient {
                     }
 
                     if (!name.equals("?")) {
+                        MapTownFacts f = extractPopupFacts(getString(m, "popup"));
+                        if (f != null) facts.putIfAbsent(name.toLowerCase(Locale.ROOT), f);
+                    }
+
+                    if (!name.equals("?")) {
                         for (String r : extractPopupResidentNames(getString(m, "popup"))) {
                             residentTown.putIfAbsent(r.toLowerCase(Locale.ROOT), name);
                         }
@@ -788,6 +986,10 @@ public class SquaremapApiClient {
                     String nation = extractNation(tooltip);
                     if (nation != null && !name.equals("?")) {
                         nations.put(name.toLowerCase(Locale.ROOT), nation);
+                        if (isCapitalTooltip(tooltip)) {
+                            capitals.add(name.toLowerCase(Locale.ROOT));
+                            capitalNames.put(name.toLowerCase(Locale.ROOT), name);
+                        }
                     }
 
                     // squaremap ships the stroke colour ("color") and the interior colour ("fillColor")
@@ -827,8 +1029,9 @@ public class SquaremapApiClient {
         if (markerFailures > 0) {
             LOGGER.warn("[TownyMap] Skipped {} unparseable town markers", markerFailures);
         }
-        return new ParsedMarkers(towns, Map.copyOf(mayors), Map.copyOf(nations),
-                Map.copyOf(residents), Map.copyOf(residentTown));
+        return new ParsedMarkers(towns, Map.copyOf(mayors), Map.copyOf(nations), Set.copyOf(capitals),
+                Map.copyOf(residents), Map.copyOf(residentTown), Map.copyOf(facts),
+                Map.copyOf(capitalNames));
     }
 
     private int[][] parseRing(JsonArray arr) {
@@ -900,7 +1103,7 @@ public class SquaremapApiClient {
                         pname.toLowerCase(Locale.ROOT), world == null ? "" : world));
             }
         } catch (Exception e) {
-            LOGGER.error("[TownyMap] Failed to parse players.json", e);
+            LOGGER.error("[TownyMap] Failed to parse the player feed", e);
         }
         return result;
     }
@@ -1000,9 +1203,57 @@ public class SquaremapApiClient {
         if (!m.find()) return null;
         String nation = stripHtml(m.group(2));
         if (nation == null || nation.isBlank() || nation.equalsIgnoreCase("None")) return null;
-        nation = nation.trim();
-        // Match the right-click title: capitals read "Capital of X", members just "X".
-        return "Capital".equalsIgnoreCase(m.group(1)) ? "Capital of " + nation : nation;
+        return nation.trim();
+    }
+
+    /** Whether the tooltip's nation clause said "Capital of" -- see POPUP_NATION for why it is separate. */
+    /**
+     * Rolls the per-town lookups up into per-nation totals.
+     *
+     * <p>Takes the maps being built rather than the volatile fields, so it sees this refresh's data
+     * and not whatever the last one happened to leave behind.
+     */
+    private static Map<String, MapNationFacts> buildNationFacts(Map<String, String> nations,
+                                                                Map<String, Integer> residents,
+                                                                Map<String, Integer> chunks,
+                                                                Map<String, String> capitalNames) {
+        record Acc(int towns, int residents, int chunks, String capital) {}
+        Map<String, Acc> acc = new HashMap<>();
+        for (Map.Entry<String, String> e : nations.entrySet()) {
+            String townKey = e.getKey();
+            String nationKey = e.getValue().toLowerCase(Locale.ROOT);
+            Acc a = acc.getOrDefault(nationKey, new Acc(0, 0, 0, ""));
+            String capital = capitalNames.containsKey(townKey) ? capitalNames.get(townKey) : a.capital();
+            acc.put(nationKey, new Acc(
+                    a.towns() + 1,
+                    a.residents() + Math.max(0, residents.getOrDefault(townKey, 0)),
+                    a.chunks() + Math.max(0, chunks.getOrDefault(townKey, 0)),
+                    capital));
+        }
+        Map<String, MapNationFacts> out = new HashMap<>(acc.size());
+        acc.forEach((k, a) -> out.put(k, new MapNationFacts(a.capital(), a.towns(), a.residents(), a.chunks())));
+        return out;
+    }
+
+    /** Founded / PVP / Public, straight out of the popup. Null when the popup has none of them. */
+    private static MapTownFacts extractPopupFacts(String popupHtml) {
+        if (popupHtml == null || popupHtml.isEmpty()) return null;
+        Matcher bd = POPUP_BOARD.matcher(popupHtml);
+        String board = bd.find() ? HTML_TAG.matcher(bd.group(1)).replaceAll("").trim() : "";
+        Matcher f = POPUP_FOUNDED.matcher(popupHtml);
+        String founded = f.find() ? HTML_TAG.matcher(f.group(1)).replaceAll("").trim() : "";
+        Matcher pv = POPUP_PVP.matcher(popupHtml);
+        boolean pvp = pv.find() && "true".equalsIgnoreCase(pv.group(1));
+        Matcher pb = POPUP_PUBLIC.matcher(popupHtml);
+        boolean isPublic = pb.find() && "true".equalsIgnoreCase(pb.group(1));
+        if (board.isEmpty() && founded.isEmpty() && !pvp && !isPublic) return null;   // nothing to store
+        return new MapTownFacts(board, founded, pvp, isPublic);
+    }
+
+    private static boolean isCapitalTooltip(String tooltipHtml) {
+        if (tooltipHtml == null) return false;
+        Matcher m = POPUP_NATION.matcher(tooltipHtml);
+        return m.find() && "Capital".equalsIgnoreCase(m.group(1));
     }
 
     private static String extractBoldText(String html) {
